@@ -2,7 +2,7 @@
 # autoconf script for swupd-daemon
 # Copyright (C) 2016 Intel Corporation
 #
-# Author: Jussi Laako <jussi.laako@linux.intel.com>
+# Contact: Jussi Laako <jussi.laako@linux.intel.com>
 #
 
 AC_PREREQ([2.68])

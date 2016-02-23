@@ -28,5 +28,6 @@
 			<arg name="options" type="a{sv}" direction="in"/>
 			<arg name="bundle" type="s" direction="in"/>
 		</method>
+		<method name="cancel"/>
 	</interface>
 </node>
