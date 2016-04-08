@@ -24,9 +24,7 @@ AC_PROG_INSTALL
 
 PKG_CHECK_MODULES(
 		  [SWUPDD],
-		  [gio-2.0 >= 2.32
-		   gio-unix-2.0 >= 2.32
-		   gobject-2.0 >= 2.32])
+		  [libsystemd >= 221])
 AC_SUBST(SWUPDD_CFLAGS)
 AC_SUBST(SWUPDD_LIBS)
 

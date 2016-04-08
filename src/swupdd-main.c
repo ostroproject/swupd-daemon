@@ -1,11 +1,7 @@
-/* vi: set et sw=4 ts=4 cino=t0,(0: */
-/* -*- Mode: C; indent-tabs-mode: nil; c-basic-offset: 4 -*- */
 /*
- *
  * Daemon for controlling Clear Linux Software Update Client
- * Copyright (C) 2016 Intel Corporation
  *
- * Contact: Jussi Laako <jussi.laako@linux.intel.com>
+ * Copyright (C) 2016 Intel Corporation
  *
  * This library is free software; you can redistribute it and/or
  * modify it under the terms of the GNU Lesser General Public
@@ -22,751 +18,627 @@
  * Foundation, Inc., 51 Franklin St, Fifth Floor, Boston, MA
  * 02110-1301 USA
  *
+ * Contact: Dmitry Rozhkov <dmitry.rozhkov@intel.com>
+ *
  */
 
-#include <stdio.h>
 #include <stdlib.h>
-#include <string.h>
-#include <signal.h>
 #include <unistd.h>
-#include <sys/types.h>
+#include <stdio.h>
+#include <errno.h>
+#include <signal.h>
+#include <assert.h>
+#include <sys/wait.h>
+#include <systemd/sd-bus.h>
 
-#include <glib.h>
-#include <glib-unix.h>
-#include <gio/gio.h>
-
-#include "swupdd-interface.h"
+#include "log.h"
+#include "list.h"
+#include "global-state.h"
 
 #define SWUPD_CLIENT    "swupd"
 
+static const char * const _method_str_map[] = {
+	NULL,
+	"checkUpdate",
+	"update",
+	"verify",
+	"bundleAdd",
+	"bundleRemove"
+};
 
-typedef struct _daemon_state
+static const char * const _method_opt_map[] = {
+	NULL,
+	"check-update",
+	"update",
+	"verify",
+	"bundle-add",
+	"bundle-remove"
+};
+
+static char **list_to_strv(struct list *strlist)
 {
-    guint busid;
-    GDBusConnection *conn;
-    ClrSoftwareUpdate *upif;
-    const gchar *url;
-    const gchar *method;
-    GSubprocess *process;
-} daemon_state_t;
+	char **strv;
+	char **temp;
 
+	strv = (char **)malloc((list_len(strlist) + 1) * sizeof(char *));
+	memset(strv, 0x00, (list_len(strlist) + 1) * sizeof(char *));
 
-static const gchar *_empty_strv[] = { NULL, };
-
-
-static gchar ** _list_to_strv (GList *list)
-{
-    gchar **strv;
-    gchar **temp;
-
-    strv = g_new0 (gchar *, g_list_length (list) + 1);
-
-    temp = strv;
-    while (list)
-    {
-        *temp = list->data;
-        temp++;
-        list = g_list_next (list);
-    }
-    return strv;
+	temp = strv;
+	while (strlist)
+	{
+		*temp = strlist->data;
+		temp++;
+		strlist = strlist->next;
+	}
+	return strv;
 }
 
-
-static GList * _set_defaults (GList *head, daemon_state_t *state)
+static int is_in_array(const char *key, char const * const arr[])
 {
-    gboolean have_url = FALSE;
-    GList *iter = head;
+	if (arr == NULL) {
+		return 0;
+	}
 
-    while (iter)
-    {
-        if (strncmp ((const char *) iter->data, "--url=", 6) == 0)
-            have_url = TRUE;
-        iter = g_list_next (iter);
-    }
-
-    if (!have_url)
-        head = g_list_append (head,
-                              g_strdup_printf ("--url=%s", state->url));
-
-    return head;
+	char const * const *temp = arr;
+	while (*temp) {
+		if (strcmp(key, *temp) == 0) {
+			return 1;
+		}
+		temp++;
+	}
+	return 0;
 }
 
-
-static void _destroy_interface (daemon_state_t *dstate)
+static int bus_message_read_option_string(struct list **strlist,
+					  sd_bus_message *m,
+					  const char *optname)
 {
-    if (!dstate->upif)
-        return;
+	int r = 0;
+	char *option = NULL;
+	const char *value;
 
-    g_dbus_interface_skeleton_unexport (
-        G_DBUS_INTERFACE_SKELETON (dstate->upif));
-    g_object_unref (dstate->upif);
-    dstate->upif = NULL;
+	r = sd_bus_message_enter_container(m, SD_BUS_TYPE_VARIANT, "s");
+	if (r < 0) {
+		ERR("Failed to enter array container: %s", strerror(-r));
+		return r;
+	}
+	r = sd_bus_message_read(m, "s", &value);
+	if (r < 0) {
+		ERR("Can't read option value: %s", strerror(-r));
+		return r;
+	}
+	r = sd_bus_message_exit_container(m);
+	if (r < 0) {
+		ERR("Can't exit variant container: %s", strerror(-r));
+		return r;
+	}
+
+	option = (char *)malloc((strlen(optname) + 3) * sizeof(char));
+	if (option == NULL) {
+		return -errno;
+	}
+	sprintf(option, "--%s", optname);
+
+	*strlist = list_append_data(*strlist, option);
+	*strlist = list_append_data(*strlist, strdup(value));
+
+	return 0;
 }
 
-
-static gboolean _signal_source_cb (gpointer user_data)
+static int bus_message_read_option_bool(struct list **strlist,
+					  sd_bus_message *m,
+					  const char *optname)
 {
-    GMainLoop *main_loop = (GMainLoop *) user_data;
+	int value;
+	int r;
 
-    g_main_loop_quit (main_loop);
+	r = sd_bus_message_enter_container(m, SD_BUS_TYPE_VARIANT, "b");
+	if (r < 0) {
+		ERR("Failed to enter array container: %s", strerror(-r));
+		return r;
+	}
+	r = sd_bus_message_read(m, "b", &value);
+	if (r < 0) {
+		ERR("Can't read option value: %s", strerror(-r));
+		return r;
+	}
+	r = sd_bus_message_exit_container(m);
+	if (r < 0) {
+		ERR("Can't exit variant container: %s", strerror(-r));
+		return r;
+	}
 
-    return G_SOURCE_CONTINUE;
+	if (value) {
+		char *option = NULL;
+
+		option = (char *)malloc((strlen(optname) + 3) * sizeof(char));
+		if (option == NULL) {
+			return -errno;
+		}
+		sprintf(option, "--%s", optname);
+		*strlist = list_append_data(*strlist, option);
+	}
+	return 0;
 }
 
-
-static void _on_process_done (GObject *object,
-                              GAsyncResult *res,
-                              gpointer user_data)
+static int bus_message_read_options(struct list **strlist,
+	                            sd_bus_message *m,
+	                            char const * const opts_str[],
+	                            char const * const opts_bool[])
 {
-    GSubprocess *proc = G_SUBPROCESS(object);
-    daemon_state_t *dstate = (daemon_state_t *) user_data;
-    GError *error = NULL;
-    gint status;
-    gchar *outbuf = NULL, *errbuf = NULL;
-    gchar **messagev;
+	int r;
 
-    status = g_subprocess_get_exit_status (dstate->process);
-    if (g_subprocess_communicate_utf8_finish (proc,
-                                              res,
-                                              &outbuf,
-                                              &errbuf,
-                                              &error))
-    {
-        messagev = g_strsplit_set (outbuf, "\r\n", -1);
-        g_free (outbuf);
-    }
-    else
-    {
-        gchar *errmsg[2] = { NULL, NULL };
-        errmsg[0] = error->message;
-        messagev = g_strdupv (errmsg);
-        g_error_free (error);
-    }
+	r = sd_bus_message_enter_container(m, SD_BUS_TYPE_ARRAY, "{sv}");
+	if (r < 0) {
+		ERR("Failed to enter array container: %s", strerror(-r));
+		return r;
+	}
 
-    g_object_unref (dstate->process);
-    dstate->process = NULL;
+	while ((r = sd_bus_message_enter_container(m, SD_BUS_TYPE_DICT_ENTRY, "sv")) > 0) {
+                const char *argname;
 
-    clr_software_update__emit_request_completed (dstate->upif,
-                                                 dstate->method,
-                                                 status,
-                                                 (const gchar * const *) messagev);
-    g_strfreev (messagev);
+                r = sd_bus_message_read(m, "s", &argname);
+                if (r < 0) {
+			ERR("Can't read argument name: %s", strerror(-r));
+                        return r;
+		}
+		if (is_in_array(argname, opts_str)) {
+			r = bus_message_read_option_string(strlist, m, argname);
+			if (r < 0) {
+				ERR("Can't read option '%s': %s", argname, strerror(-r));
+				return r;
+			}
+		} else if (is_in_array(argname, opts_bool)) {
+			r = bus_message_read_option_bool(strlist, m, argname);
+			if (r < 0) {
+				ERR("Can't read option '%s': %s", argname, strerror(-r));
+				return r;
+			}
+		} else {
+			r = sd_bus_message_skip(m, "v");
+			if (r < 0) {
+				ERR("Can't skip unwanted option value: %s", strerror(-r));
+				return r;
+			}
+		}
+
+                r = sd_bus_message_exit_container(m);
+                if (r < 0) {
+			ERR("Can't exit dict entry container: %s", strerror(-r));
+                        return r;
+		}
+	}
+	r = sd_bus_message_exit_container(m);
+	if (r < 0) {
+		ERR("Can't exit array container: %s", strerror(-r));
+		return r;
+	}
+
+	return 0;
 }
 
-
-static void _handle_common_options (gchar *key,
-                                    GVariant *value,
-                                    GList *args)
+static void on_child_exit(int signum)
 {
-    if (g_strcmp0 (key, "url") == 0)
-    {
-        args = g_list_append (args,
-                              g_strdup_printf ("--url=%s",
-                                               g_variant_get_string (value, NULL)));
-    }
-    else if (g_strcmp0 (key, "port") == 0)
-    {
-        args = g_list_append (args,
-                              g_strdup_printf ("--port=%u",
-                                               g_variant_get_uint16 (value)));
-    }
-    else if (g_strcmp0 (key, "contenturl") == 0 ||
-             g_strcmp0 (key, "versionurl") == 0)
-    {
-        args = g_list_append (args,
-                              g_strdup_printf ("--%s=%s",
-                                               key,
-                                               g_variant_get_string (value, NULL)));
-    }
-    else if (g_strcmp0 (key, "format") == 0)
-    {
-        args = g_list_append (args,
-                              g_strdup_printf ("--format=%s",
-                                               g_variant_get_string (value, NULL)));
-    }
-    else if (g_strcmp0 (key, "path") == 0)
-    {
-        args = g_list_append (args,
-                              g_strdup_printf ("--path=%s",
-                                               g_variant_get_string (value, NULL)));
-    }
-    else if (g_strcmp0 (key, "force") == 0)
-    {
-        args = g_list_append (args,
-                              g_strdup ("--force"));
-    }
+	int child_exit_status;
+	int status = 0;
+	char **lines = NULL;
+	char **temp = NULL;
+	sd_bus_message *m = NULL;
+	int r;
+
+	pid_t child_pid = global_state_get_child_pid();
+	assert(child_pid);
+	method_t child_method = global_state_get_child_method();
+	assert(child_method);
+	int channel_fd = global_state_get_child_channel_fd();
+	assert(channel_fd >= 0);
+
+	{
+		FILE *stream = fdopen(channel_fd, "r");
+		char *line = NULL;
+		ssize_t count;
+		size_t len = 0;
+		size_t line_count = 0;
+
+		while ((count = getline(&line, &len, stream)) != -1) {
+			printf(line); /* echo child's output */
+			line[strcspn(line, "\n")] = 0; /* trim newline */
+			line_count++;
+			lines = realloc(lines, sizeof(char*) * line_count);
+			lines[line_count-1] = strdup(line);
+		}
+		free(line);
+		/* realloc one extra element for the last NULL */
+		lines = realloc(lines, sizeof(char*) * (line_count + 1));
+		lines[line_count] = NULL;
+
+		fclose(stream);
+	}
+
+	pid_t ws = waitpid(child_pid, &child_exit_status, 0);
+	if (ws == -1) {
+		ERR("Failed to wait for child process");
+		assert(0);
+	}
+
+	if (WIFEXITED(child_exit_status)) {
+		status = WEXITSTATUS(child_exit_status);
+		if (status != 0) {
+			DEBUG("Failed to run command");
+		}
+	} else {
+		DEBUG("Child process was killed");
+		status = 130; /* killed by SIGINT */
+	}
+
+	global_state_set_child_data(0, METHOD_NOTSET, -1);
+
+	r = sd_bus_message_new_signal(global_state_get_bus(), &m,
+		                      "/org/O1/swupdd/Client",
+		                      "org.O1.swupdd.Client",
+		                      "requestCompleted");
+	if (r < 0) {
+		ERR("Can't create D-Bus signal: %s", strerror(-r));
+		goto finish;
+	}
+	r = sd_bus_message_append(m, "si", _method_str_map[child_method], status);
+	if (r < 0) {
+		ERR("Can't append method and status to D-Bus message: %s", strerror(-r));
+		goto finish;
+	}
+	r = sd_bus_message_append_strv(m, lines);
+	if (r < 0) {
+		ERR("Can't append output to D-Bus message: %s", strerror(-r));
+		goto finish;
+	}
+	r = sd_bus_send(global_state_get_bus(), m, NULL);
+	if (r < 0) {
+		ERR("Can't send message: %s", strerror(-r));
+		goto finish;
+	}
+
+finish:
+	temp = lines;
+	while (*temp) {
+		free(*temp);
+		temp++;
+	}
+	free(lines);
+	sd_bus_message_unref(m);
 }
 
-
-static gboolean _on_bundle_add (ClrSoftwareUpdate *object,
-                                GDBusMethodInvocation *invocation,
-                                GVariant *arg_options,
-                                const gchar *const *arg_bundles,
-                                gpointer user_data)
+static int run_swupd(method_t method, struct list *args)
 {
-    daemon_state_t *dstate = (daemon_state_t *) user_data;
-    GError *error = NULL;
-    GList *args = NULL;
-    GVariantIter iter;
-    GVariant *value;
-    gchar *key;
-    gchar **argv;
+	pid_t pid;
+	int fds[2];
+	int r;
 
-    g_message ("bundleAdd");
-    clr_software_update__complete_bundle_add (object, invocation,
-                                              (dstate->process == NULL));
-    if (dstate->process)
-        return FALSE;
+	r = pipe(fds);
+	if (r < 0) {
+		ERR("Can't create pipe: %s", strerror(errno));
+		return -errno;
+	}
 
-    args = g_list_append (args, g_strdup (SWUPD_CLIENT));
-    args = g_list_append (args, g_strdup ("bundle-add"));
+	pid = fork();
 
-    g_variant_iter_init (&iter, arg_options);
-    while (g_variant_iter_next (&iter, "{sv}", &key, &value))
-    {
-        if (g_strcmp0 (key, "list") == 0)
-        {
-            args = g_list_append (args,
-                                  g_strdup ("--list"));
-        }
-        else
-            _handle_common_options (key, value, args);
-        g_free (key);
-        g_variant_unref (value);
-    }
+	if (pid == 0) { /* child */
+		dup2(STDOUT_FILENO, STDERR_FILENO);
+		while ((dup2(fds[1], STDOUT_FILENO) == -1) && (errno == EINTR)) {}
+		close(fds[1]);
+		close(fds[0]);
+		char **argv = list_to_strv(list_head(args));
+		execvp(*argv, argv);
+		ERR("This line must not be reached");
+		_exit(1);
+	} else if (pid < 0) {
+		ERR("Failed to fork: %s", strerror(errno));
+		return -errno;
+	}
 
-    while (*arg_bundles)
-    {
-        args = g_list_append (args,
-                              g_strdup (*arg_bundles));
-        arg_bundles++;
-    }
+	close(fds[1]);
+	global_state_set_child_data(pid, method, fds[0]);
 
-    args = _set_defaults (args, dstate);
-    argv = _list_to_strv (args);
-    dstate->method = "bundleAdd";
-    dstate->process = g_subprocess_newv ((const gchar * const *) argv,
-                                         G_SUBPROCESS_FLAGS_STDOUT_PIPE |
-                                         G_SUBPROCESS_FLAGS_STDERR_MERGE,
-                                         &error);
-    if (dstate->process == NULL)
-    {
-        gchar *errmsg[2] = { NULL, NULL };
-        errmsg[0] = error->message;
-        clr_software_update__emit_request_completed (object,
-                                                     dstate->method,
-                                                     -1,
-                                                     (const gchar * const *) errmsg);
-        g_error_free (error);
-    }
-    else
-    {
-        g_subprocess_communicate_utf8_async (dstate->process,
-                                             NULL,
-                                             NULL,
-                                             _on_process_done,
-                                             dstate);
-    }
-
-    g_free (argv);
-    g_list_free_full (args, g_free);
-
-    return TRUE;
+	return 0;
 }
 
-
-static gboolean _on_bundle_remove (ClrSoftwareUpdate *object,
-                                   GDBusMethodInvocation *invocation,
-                                   GVariant *arg_options,
-                                   const gchar *arg_bundle,
-                                   gpointer user_data)
+static int method_update(sd_bus_message *m,
+	                 void *userdata,
+	                 sd_bus_error *ret_error)
 {
-    daemon_state_t *dstate = (daemon_state_t *) user_data;
-    GError *error = NULL;
-    GList *args = NULL;
-    GVariantIter iter;
-    GVariant *value;
-    gchar *key;
-    gchar **argv;
+	int r = 0;
+	struct list *args = NULL;
 
-    g_message ("bundleRemove");
-    clr_software_update__complete_bundle_remove (object, invocation,
-                                                 (dstate->process == NULL));
-    if (dstate->process)
-        return FALSE;
+	if (global_state_get_child_pid()) {
+		r = -EAGAIN;
+		ERR("Busy with ongoing request to swupd");
+		goto finish;
+	}
 
-    args = g_list_append (args, g_strdup (SWUPD_CLIENT));
-    args = g_list_append (args, g_strdup ("bundle-remove"));
+	args = list_append_data(args, strdup(SWUPD_CLIENT));
+	args = list_append_data(args, strdup(_method_opt_map[METHOD_UPDATE]));
 
-    g_variant_iter_init (&iter, arg_options);
-    while (g_variant_iter_next (&iter, "{sv}", &key, &value))
-    {
-        _handle_common_options (key, value, args);
-        g_free (key);
-        g_variant_unref (value);
-    }
+	char const * const accepted_str_opts[] = {"url", "contenturl", "versionurl", "log", NULL};
+	r = bus_message_read_options(&args, m, accepted_str_opts, NULL);
+	if (r < 0) {
+		ERR("Can't read options: %s", strerror(-r));
+		goto finish;
+	}
 
-    if (arg_bundle)
-        args = g_list_append (args,
-                              g_strdup (arg_bundle));
+	r  = run_swupd(METHOD_UPDATE, args);
+	if (r < 0) {
+		ERR("Got error when running swupd command: %s", strerror(-r));
+	}
 
-    args = _set_defaults (args, dstate);
-    argv = _list_to_strv (args);
-    dstate->method = "bundleRemove";
-    dstate->process = g_subprocess_newv ((const gchar * const *) argv,
-                                         G_SUBPROCESS_FLAGS_STDOUT_PIPE |
-                                         G_SUBPROCESS_FLAGS_STDERR_MERGE,
-                                         &error);
-    if (dstate->process == NULL)
-    {
-        gchar *errmsg[2] = { NULL, NULL };
-        errmsg[0] = error->message;
-        clr_software_update__emit_request_completed (object,
-                                                     dstate->method,
-                                                     -1,
-                                                     (const gchar * const *) errmsg);
-        g_error_free (error);
-    }
-    else
-    {
-        g_subprocess_communicate_utf8_async (dstate->process,
-                                             NULL,
-                                             NULL,
-                                             _on_process_done,
-                                             dstate);
-    }
-
-    g_free (argv);
-    g_list_free_full (args, g_free);
-
-    return TRUE;
+finish:
+	list_free_list_and_data(args, free);
+	return sd_bus_reply_method_return(m, "b", (r >= 0));
 }
 
-
-static gboolean _on_cancel (ClrSoftwareUpdate *object,
-                            GDBusMethodInvocation *invocation,
-                            gboolean arg_force,
-                            gpointer user_data)
+static int method_verify(sd_bus_message *m,
+	                 void *userdata,
+	                 sd_bus_error *ret_error)
 {
-    daemon_state_t *dstate = (daemon_state_t *) user_data;
+	int r = 0;
+	struct list *args = NULL;
 
-    g_message ("cancel");
-    clr_software_update__complete_cancel (object, invocation,
-                                          (dstate->process != NULL));
-    if (!dstate->process)
-        return FALSE;
+	if (global_state_get_child_pid()) {
+		r = -EAGAIN;
+		ERR("Busy with ongoing request to swupd");
+		goto finish;
+	}
 
-    if (arg_force)
-        g_subprocess_force_exit (dstate->process);
-    else
-        g_subprocess_send_signal (dstate->process, SIGINT);
+	args = list_append_data(args, strdup(SWUPD_CLIENT));
+	args = list_append_data(args, strdup(_method_opt_map[METHOD_VERIFY]));
 
-    clr_software_update__emit_request_completed (object,
-                                                 "cancel",
-                                                 0,
-                                                 _empty_strv);
-    return TRUE;
+	char const * const accepted_str_opts[] = {"url", "contenturl", "versionurl", "log", NULL};
+	char const * const accepted_bool_opts[] = {"fix", NULL};
+	r = bus_message_read_options(&args, m, accepted_str_opts, accepted_bool_opts);
+	if (r < 0) {
+		ERR("Can't read options: %s", strerror(-r));
+		goto finish;
+	}
+
+	r  = run_swupd(METHOD_VERIFY, args);
+	if (r < 0) {
+		ERR("Got error when running swupd command: %s", strerror(-r));
+	}
+
+finish:
+	list_free_list_and_data(args, free);
+	return sd_bus_reply_method_return(m, "b", (r >= 0));
 }
 
-
-static gboolean _on_check_update (ClrSoftwareUpdate *object,
-                                  GDBusMethodInvocation *invocation,
-                                  GVariant *arg_options,
-                                  const gchar *arg_bundle,
-                                  gpointer user_data)
+static int method_check_update(sd_bus_message *m,
+			       void *userdata,
+			       sd_bus_error *ret_error)
 {
-    daemon_state_t *dstate = (daemon_state_t *) user_data;
-    GError *error = NULL;
-    GList *args = NULL;
-    GVariantIter iter;
-    GVariant *value;
-    gchar *key;
-    gchar **argv;
+	int r = 0;
+	struct list *args = NULL;
 
-    g_message ("checkUpdate");
-    clr_software_update__complete_check_update (object, invocation,
-                                                (dstate->process == NULL));
-    if (dstate->process)
-        return FALSE;
+	if (global_state_get_child_pid()) {
+		r = -EAGAIN;
+		ERR("Busy with ongoing request to swupd");
+		goto finish;
+	}
 
-    args = g_list_append (args, g_strdup (SWUPD_CLIENT));
-    args = g_list_append (args, g_strdup ("check-update"));
+	args = list_append_data(args, strdup(SWUPD_CLIENT));
+	args = list_append_data(args, strdup(_method_opt_map[METHOD_CHECK_UPDATE]));
 
-    g_variant_iter_init (&iter, arg_options);
-    while (g_variant_iter_next (&iter, "{sv}", &key, &value))
-    {
-        _handle_common_options (key, value, args);
-        g_free (key);
-        g_variant_unref (value);
-    }
+	char const * const accepted_str_opts[] = {"url", NULL};
+	r = bus_message_read_options(&args, m, accepted_str_opts, NULL);
+	if (r < 0) {
+		ERR("Can't read options: %s", strerror(-r));
+		goto finish;
+	}
 
-    args = _set_defaults (args, dstate);
-    argv = _list_to_strv (args);
-    dstate->method = "checkUpdate";
-    dstate->process = g_subprocess_newv ((const gchar * const *) argv,
-                                         G_SUBPROCESS_FLAGS_STDOUT_PIPE |
-                                         G_SUBPROCESS_FLAGS_STDERR_MERGE,
-                                         &error);
-    if (dstate->process == NULL)
-    {
-        gchar *errmsg[2] = { NULL, NULL };
-        errmsg[0] = error->message;
-        clr_software_update__emit_request_completed (object,
-                                                     dstate->method,
-                                                     -1,
-                                                     (const gchar * const *) errmsg);
-        g_error_free (error);
-    }
-    else
-    {
-        g_subprocess_communicate_utf8_async (dstate->process,
-                                             NULL,
-                                             NULL,
-                                             _on_process_done,
-                                             dstate);
-    }
+	const char *bundle;
+	r = sd_bus_message_read(m, "s", &bundle);
+	if (r < 0) {
+		ERR("Can't read bundle: %s", strerror(-r));
+		goto finish;
+	}
+	args = list_append_data(args, strdup(bundle));
 
-    g_free (argv);
-    g_list_free_full (args, g_free);
+	r  = run_swupd(METHOD_CHECK_UPDATE, args);
+	if (r < 0) {
+		ERR("Got error when running swupd command: %s", strerror(-r));
+	}
 
-    return TRUE;
+finish:
+	list_free_list_and_data(args, free);
+	return sd_bus_reply_method_return(m, "b", (r >= 0));
 }
 
-
-static gboolean _on_hash_dump (ClrSoftwareUpdate *object,
-                               GDBusMethodInvocation *invocation,
-                               GVariant *arg_options,
-                               const gchar *arg_filename,
-                               gpointer user_data)
+static int method_bundle_add(sd_bus_message *m,
+			     void *userdata,
+			     sd_bus_error *ret_error)
 {
-    daemon_state_t *dstate = (daemon_state_t *) user_data;
-    GError *error = NULL;
-    GList *args = NULL;
-    GVariantIter iter;
-    GVariant *value;
-    gchar *key;
-    gchar **argv;
+	int r = 0;
+	struct list *args = NULL;
+	const char* bundle = NULL;
 
-    g_message ("hashDump");
-    clr_software_update__complete_hash_dump (object, invocation,
-                                             (dstate->process == NULL));
-    if (dstate->process)
-        return FALSE;
+	if (global_state_get_child_pid()) {
+		r = -EAGAIN;
+		ERR("Busy with ongoing request to swupd");
+		goto finish;
+	}
 
-    args = g_list_append (args, g_strdup (SWUPD_CLIENT));
-    args = g_list_append (args, g_strdup ("hashdump"));
+	args = list_append_data(args, strdup(SWUPD_CLIENT));
+	args = list_append_data(args, strdup(_method_opt_map[METHOD_BUNDLE_ADD]));
 
-    g_variant_iter_init (&iter, arg_options);
-    while (g_variant_iter_next (&iter, "{sv}", &key, &value))
-    {
-        _handle_common_options (key, value, args);
-        g_free (key);
-        g_variant_unref (value);
-    }
+	char const * const accepted_str_opts[] = {"url", NULL};
+	char const * const accepted_bool_opts[] = {"list", NULL};
+	r = bus_message_read_options(&args, m, accepted_str_opts, accepted_bool_opts);
+	if (r < 0) {
+		ERR("Can't read options: %s", strerror(-r));
+		goto finish;
+	}
 
-    if (arg_filename)
-        args = g_list_append (args,
-                              g_strdup (arg_filename));
+	r = sd_bus_message_enter_container(m, SD_BUS_TYPE_ARRAY, "s");
+	if (r < 0) {
+		ERR("Can't enter container: %s", strerror(-r));
+		goto finish;
+	}
+	while ((r = sd_bus_message_read(m, "s", &bundle)) > 0) {
+		args = list_append_data(args, strdup(bundle));
+	}
+	if (r < 0) {
+		ERR("Can't read bundle name from message: %s", strerror(-r));
+		goto finish;
+	}
+	r = sd_bus_message_exit_container(m);
+	if (r < 0) {
+		ERR("Can't exit array container: %s", strerror(-r));
+		goto finish;
+	}
 
-    argv = _list_to_strv (args);
-    dstate->method = "hashDump";
-    dstate->process = g_subprocess_newv ((const gchar * const *) argv,
-                                         G_SUBPROCESS_FLAGS_STDOUT_PIPE |
-                                         G_SUBPROCESS_FLAGS_STDERR_MERGE,
-                                         &error);
-    if (dstate->process == NULL)
-    {
-        gchar *errmsg[2] = { NULL, NULL };
-        errmsg[0] = error->message;
-        clr_software_update__emit_request_completed (object,
-                                                     dstate->method,
-                                                     -1,
-                                                     (const gchar * const *) errmsg);
-        g_error_free (error);
-    }
-    else
-    {
-        g_subprocess_communicate_utf8_async (dstate->process,
-                                             NULL,
-                                             NULL,
-                                             _on_process_done,
-                                             dstate);
-    }
+	r  = run_swupd(METHOD_BUNDLE_ADD, args);
+	if (r < 0) {
+		ERR("Got error when running swupd command: %s", strerror(-r));
+	}
 
-    g_free (argv);
-    g_list_free_full (args, g_free);
-
-    return TRUE;
+finish:
+	list_free_list_and_data(args, free);
+	return sd_bus_reply_method_return(m, "b", (r >= 0));
 }
 
-
-static gboolean _on_update (ClrSoftwareUpdate *object,
-                            GDBusMethodInvocation *invocation,
-                            GVariant *arg_options,
-                            gpointer user_data)
+static int method_bundle_remove(sd_bus_message *m,
+			        void *userdata,
+			        sd_bus_error *ret_error)
 {
-    daemon_state_t *dstate = (daemon_state_t *) user_data;
-    GError *error = NULL;
-    GList *args = NULL;
-    GVariantIter iter;
-    GVariant *value;
-    gchar *key;
-    gchar **argv;
+	int r = 0;
+	struct list *args = NULL;
 
-    g_message ("update");
-    clr_software_update__complete_update (object, invocation,
-                                          (dstate->process == NULL));
-    if (dstate->process)
-        return FALSE;
+	if (global_state_get_child_pid()) {
+		r = -EAGAIN;
+		ERR("Busy with ongoing request to swupd");
+		goto finish;
+	}
 
-    args = g_list_append (args, g_strdup (SWUPD_CLIENT));
-    args = g_list_append (args, g_strdup ("update"));
+	args = list_append_data(args, strdup(SWUPD_CLIENT));
+	args = list_append_data(args, strdup(_method_opt_map[METHOD_BUNDLE_REMOVE]));
 
-    g_variant_iter_init (&iter, arg_options);
-    while (g_variant_iter_next (&iter, "{sv}", &key, &value))
-    {
-        if (g_strcmp0 (key, "download") == 0)
-        {
-            args = g_list_append (args,
-                                  g_strdup ("--download"));
-        }
-        else if (g_strcmp0 (key, "status") == 0)
-        {
-            args = g_list_append (args,
-                                  g_strdup ("--status"));
-        }
-        else
-            _handle_common_options (key, value, args);
-        g_free (key);
-        g_variant_unref (value);
-    }
+	char const * const accepted_str_opts[] = {"url", NULL};
+	r = bus_message_read_options(&args, m, accepted_str_opts, NULL);
+	if (r < 0) {
+		ERR("Can't read options: %s", strerror(-r));
+		goto finish;
+	}
 
-    args = _set_defaults (args, dstate);
-    argv = _list_to_strv (args);
-    dstate->method = "update";
-    dstate->process = g_subprocess_newv ((const gchar * const *) argv,
-                                         G_SUBPROCESS_FLAGS_STDOUT_PIPE |
-                                         G_SUBPROCESS_FLAGS_STDERR_MERGE,
-                                         &error);
-    if (dstate->process == NULL)
-    {
-        gchar *errmsg[2] = { NULL, NULL };
-        errmsg[0] = error->message;
-        clr_software_update__emit_request_completed (object,
-                                                     dstate->method,
-                                                     -1,
-                                                     (const gchar * const *) errmsg);
-        g_error_free (error);
-    }
-    else
-    {
-        g_subprocess_communicate_utf8_async (dstate->process,
-                                             NULL,
-                                             NULL,
-                                             _on_process_done,
-                                             dstate);
-    }
+	const char *bundle;
+	r = sd_bus_message_read(m, "s", &bundle);
+	if (r < 0) {
+		ERR("Can't read bundle: %s", strerror(-r));
+		goto finish;
+	}
+	args = list_append_data(args, strdup(bundle));
 
-    g_free (argv);
-    g_list_free_full (args, g_free);
+	r  = run_swupd(METHOD_BUNDLE_REMOVE, args);
+	if (r < 0) {
+		ERR("Got error when running swupd command: %s", strerror(-r));
+	}
 
-    return TRUE;
+finish:
+	list_free_list_and_data(args, free);
+	return sd_bus_reply_method_return(m, "b", (r >= 0));
 }
 
-
-static gboolean _on_verify (ClrSoftwareUpdate *object,
-                            GDBusMethodInvocation *invocation,
-                            GVariant *arg_options,
-                            gpointer user_data)
+static int method_cancel(sd_bus_message *m,
+			 void *userdata,
+			 sd_bus_error *ret_error)
 {
-    daemon_state_t *dstate = (daemon_state_t *) user_data;
-    GError *error = NULL;
-    GList *args = NULL;
-    GVariantIter iter;
-    GVariant *value;
-    gchar *key;
-    gchar **argv;
+	int r = 0;
+	pid_t child;
+	int force;
 
-    g_message ("verify");
-    clr_software_update__complete_verify (object, invocation,
-                                          (dstate->process == NULL));
-    if (dstate->process)
-        return FALSE;
+	child = global_state_get_child_pid();
+	if (!child) {
+		r = -ECHILD;
+		ERR("No child process to cancel");
+		goto finish;
+	}
 
-    args = g_list_append (args, g_strdup (SWUPD_CLIENT));
-    args = g_list_append (args, g_strdup ("verify"));
+	r = sd_bus_message_read(m, "b", &force);
+	if (r < 0) {
+		ERR("Can't read 'force' option: %s", strerror(-r));
+		goto finish;
+	}
 
-    g_variant_iter_init (&iter, arg_options);
-    while (g_variant_iter_next (&iter, "{sv}", &key, &value))
-    {
-        if (g_strcmp0 (key, "manifest") == 0)
-        {
-            args = g_list_append (args,
-                                  g_strdup_printf ("--manifest=%s",
-                                                   g_variant_get_string (value, NULL)));
-        }
-        else if (g_strcmp0 (key, "fix") == 0)
-        {
-            args = g_list_append (args,
-                                  g_strdup ("--fix"));
-        }
-        else if (g_strcmp0 (key, "install") == 0)
-        {
-            args = g_list_append (args,
-                                  g_strdup ("--install"));
-        }
-        else if (g_strcmp0 (key, "quick") == 0)
-        {
-            args = g_list_append (args,
-                                  g_strdup ("--quick"));
-        }
-        else
-            _handle_common_options (key, value, args);
-        g_free (key);
-        g_variant_unref (value);
-    }
+	if (force) {
+		kill(child, SIGKILL);
+	} else {
+		kill(child, SIGINT);
+	}
 
-    args = _set_defaults (args, dstate);
-    argv = _list_to_strv (args);
-    dstate->method = "verify";
-    dstate->process = g_subprocess_newv ((const gchar * const *) argv,
-                                         G_SUBPROCESS_FLAGS_STDOUT_PIPE |
-                                         G_SUBPROCESS_FLAGS_STDERR_MERGE,
-                                         &error);
-    if (dstate->process == NULL)
-    {
-        gchar *errmsg[2] = { NULL, NULL };
-        errmsg[0] = error->message;
-        clr_software_update__emit_request_completed (object,
-                                                     dstate->method,
-                                                     -1,
-                                                     (const gchar * const *) errmsg);
-        g_error_free (error);
-    }
-    else
-    {
-        g_subprocess_communicate_utf8_async (dstate->process,
-                                             NULL,
-                                             NULL,
-                                             _on_process_done,
-                                             dstate);
-    }
-
-    g_free (argv);
-    g_list_free_full (args, g_free);
-
-    return TRUE;
+finish:
+	return sd_bus_reply_method_return(m, "b", (r >= 0));
 }
 
+static const sd_bus_vtable swupdd_vtable[] = {
+	SD_BUS_VTABLE_START(0),
+	SD_BUS_METHOD("checkUpdate", "a{sv}s", "b", method_check_update, 0),
+	SD_BUS_METHOD("update", "a{sv}", "b", method_update, 0),
+	SD_BUS_METHOD("verify", "a{sv}", "b", method_verify, 0),
+	SD_BUS_METHOD("bundleAdd", "a{sv}as", "b", method_bundle_add, 0),
+	SD_BUS_METHOD("bundleRemove", "a{sv}s", "b", method_bundle_remove, 0),
+	SD_BUS_METHOD("cancel", "b", "b", method_cancel, 0),
+	SD_BUS_SIGNAL("requestCompleted", "sias", 0),
+	SD_BUS_VTABLE_END
+};
 
-static void _on_bus_acquired (GDBusConnection *connection,
-                              const gchar *name,
-                              gpointer user_data)
-{
-    daemon_state_t *dstate = (daemon_state_t *) user_data;
-    GError *error = NULL;
+int main(int argc, char *argv[]) {
+	sd_bus_slot *slot = NULL;
+	sd_bus *bus = NULL;
+	int r;
 
-    g_message ("bus acquired");
+	global_state_reset();
 
-    dstate->conn = connection;
-    dstate->upif = clr_software_update__skeleton_new ();
-    if (!dstate->upif)
-        g_error ("failed to create interface object");
-    if (!g_dbus_interface_skeleton_export (
-        G_DBUS_INTERFACE_SKELETON (dstate->upif),
-        connection,
-        "/org/O1/swupdd/Client",
-        &error))
-    {
-        g_error ("exporting interface failed: %s", error->message);
-        g_error_free (error);
-    }
+	signal(SIGCHLD, on_child_exit);
+
+	r = sd_bus_open_system(&bus);
+	if (r < 0) {
+		ERR("Failed to connect to system bus: %s\n", strerror(-r));
+		goto finish;
+	}
+	global_state_set_bus(bus);
+
+	r = sd_bus_add_object_vtable(bus,
+				     &slot,
+				     "/org/O1/swupdd/Client",
+				     "org.O1.swupdd.Client",
+				     swupdd_vtable,
+				     NULL);
+	if (r < 0) {
+		ERR("Failed to issue method call: %s\n", strerror(-r));
+		goto finish;
+	}
+
+	r = sd_bus_request_name(bus, "org.O1.swupdd.Client", 0);
+	if (r < 0) {
+		ERR("Failed to acquire service name: %s\n", strerror(-r));
+		goto finish;
+	}
+
+	for (;;) {
+		r = sd_bus_process(bus, NULL);
+		if (r < 0) {
+			ERR("Failed to process: %s\n", strerror(-r));
+			goto finish;
+		}
+		if (r > 0) {
+			continue;
+		}
+
+		r = sd_bus_wait(bus, (uint64_t) -1);
+		if (r < 0 && r != -EINTR) {
+			ERR("Failed to wait on bus: %s\n", strerror(-r));
+			goto finish;
+		}
+	}
+
+finish:
+	sd_bus_slot_unref(slot);
+	sd_bus_unref(bus);
+
+	return r < 0 ? EXIT_FAILURE : EXIT_SUCCESS;
 }
-
-
-static void _on_name_acquired (GDBusConnection *connection,
-                               const gchar *name,
-                               gpointer user_data)
-{
-    daemon_state_t *dstate = (daemon_state_t *) user_data;
-
-    g_message ("name acquired");
-
-    g_signal_connect (dstate->upif,
-                      "handle-bundle-add",
-                      G_CALLBACK (_on_bundle_add),
-                      dstate);
-    g_signal_connect (dstate->upif,
-                      "handle-bundle-remove",
-                      G_CALLBACK (_on_bundle_remove),
-                      dstate);
-    g_signal_connect (dstate->upif,
-                      "handle-hash-dump",
-                      G_CALLBACK (_on_hash_dump),
-                      dstate);
-    g_signal_connect (dstate->upif,
-                      "handle-update",
-                      G_CALLBACK (_on_update),
-                      dstate);
-    g_signal_connect (dstate->upif,
-                      "handle-verify",
-                      G_CALLBACK (_on_verify),
-                      dstate);
-    g_signal_connect (dstate->upif,
-                      "handle-check-update",
-                      G_CALLBACK (_on_check_update),
-                      dstate);
-    g_signal_connect (dstate->upif,
-                      "handle-cancel",
-                      G_CALLBACK (_on_cancel),
-                      dstate);
-}
-
-
-static void _on_name_lost (GDBusConnection *connection,
-                           const gchar *name,
-                           gpointer user_data)
-{
-    daemon_state_t *dstate = (daemon_state_t *) user_data;
-
-    g_message ("name lost");
-
-    _destroy_interface (dstate);
-}
-
-
-int main (int argc, char *argv[])
-{
-    GMainLoop *main_loop;
-    guint sigid_int, sigid_term;
-    daemon_state_t dstate;
-
-    signal(SIGPIPE, SIG_IGN);
-    memset (&dstate, 0x00, sizeof(dstate));
-
-    dstate.url = g_getenv ("SWUPDD_URL");
-
-    main_loop = g_main_loop_new (NULL, FALSE);
-    sigid_int = g_unix_signal_add (SIGINT, _signal_source_cb, main_loop);
-    sigid_term = g_unix_signal_add (SIGTERM, _signal_source_cb, main_loop);
-
-    dstate.busid = g_bus_own_name (G_BUS_TYPE_SYSTEM,
-                                   "org.O1.swupdd.Client",
-                                   G_BUS_NAME_OWNER_FLAGS_NONE,
-                                   _on_bus_acquired,
-                                   _on_name_acquired,
-                                   _on_name_lost,
-                                   &dstate,
-                                   NULL);
-
-    g_main_loop_run (main_loop);
-
-    _destroy_interface (&dstate);
-    g_bus_unown_name (dstate.busid);
-
-    g_source_remove (sigid_int);
-    g_source_remove (sigid_term);
-
-    return 0;
-}
-
