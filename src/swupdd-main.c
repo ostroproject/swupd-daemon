@@ -503,8 +503,8 @@ finish:
 }
 
 static int method_bundle_remove(sd_bus_message *m,
-			        void *userdata,
-			        sd_bus_error *ret_error)
+				void *userdata,
+				sd_bus_error *ret_error)
 {
 	int r = 0;
 	struct list *args = NULL;
@@ -597,7 +597,7 @@ int main(int argc, char *argv[]) {
 
 	r = sd_bus_open_system(&bus);
 	if (r < 0) {
-		ERR("Failed to connect to system bus: %s\n", strerror(-r));
+		ERR("Failed to connect to system bus: %s", strerror(-r));
 		goto finish;
 	}
 	global_state_set_bus(bus);
@@ -609,20 +609,20 @@ int main(int argc, char *argv[]) {
 				     swupdd_vtable,
 				     NULL);
 	if (r < 0) {
-		ERR("Failed to issue method call: %s\n", strerror(-r));
+		ERR("Failed to issue method call: %s", strerror(-r));
 		goto finish;
 	}
 
 	r = sd_bus_request_name(bus, "org.O1.swupdd.Client", 0);
 	if (r < 0) {
-		ERR("Failed to acquire service name: %s\n", strerror(-r));
+		ERR("Failed to acquire service name: %s", strerror(-r));
 		goto finish;
 	}
 
 	for (;;) {
 		r = sd_bus_process(bus, NULL);
 		if (r < 0) {
-			ERR("Failed to process: %s\n", strerror(-r));
+			ERR("Failed to process: %s", strerror(-r));
 			goto finish;
 		}
 		if (r > 0) {
@@ -631,7 +631,7 @@ int main(int argc, char *argv[]) {
 
 		r = sd_bus_wait(bus, (uint64_t) -1);
 		if (r < 0 && r != -EINTR) {
-			ERR("Failed to wait on bus: %s\n", strerror(-r));
+			ERR("Failed to wait on bus: %s", strerror(-r));
 			goto finish;
 		}
 	}
