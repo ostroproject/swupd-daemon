@@ -22,6 +22,8 @@
  *
  */
 
+#define _GNU_SOURCE
+
 #include <stdlib.h>
 #include <unistd.h>
 #include <stdio.h>
@@ -113,11 +115,10 @@ static int bus_message_read_option_string(struct list **strlist,
 		return r;
 	}
 
-	option = (char *)malloc((strlen(optname) + 3) * sizeof(char));
-	if (option == NULL) {
-		return -errno;
+	r = asprintf(&option, "--%s", optname);
+	if (r < 0) {
+		return -ENOMEM;
 	}
-	sprintf(option, "--%s", optname);
 
 	*strlist = list_append_data(*strlist, option);
 	*strlist = list_append_data(*strlist, strdup(value));
@@ -151,11 +152,10 @@ static int bus_message_read_option_bool(struct list **strlist,
 	if (value) {
 		char *option = NULL;
 
-		option = (char *)malloc((strlen(optname) + 3) * sizeof(char));
-		if (option == NULL) {
-			return -errno;
+		r = asprintf(&option, "--%s", optname);
+		if (r < 0) {
+			return -ENOMEM;
 		}
-		sprintf(option, "--%s", optname);
 		*strlist = list_append_data(*strlist, option);
 	}
 	return 0;
