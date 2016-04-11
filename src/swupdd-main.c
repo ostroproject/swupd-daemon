@@ -29,7 +29,6 @@
 #include <stdio.h>
 #include <stdbool.h>
 #include <errno.h>
-#include <signal.h>
 #include <assert.h>
 #include <sys/wait.h>
 #include <systemd/sd-bus.h>
@@ -37,9 +36,24 @@
 
 #include "log.h"
 #include "list.h"
-#include "global-state.h"
 
 #define SWUPD_CLIENT    "swupd"
+
+typedef enum {
+	METHOD_NOTSET = 0,
+	METHOD_CHECK_UPDATE,
+	METHOD_UPDATE,
+	METHOD_VERIFY,
+	METHOD_BUNDLE_ADD,
+	METHOD_BUNDLE_REMOVE
+} method_t;
+
+typedef struct _daemon_state {
+	sd_bus *bus;
+	pid_t child;
+	method_t method;
+	int channel_fd;
+} daemon_state_t;
 
 static const char * const _method_str_map[] = {
 	NULL,
@@ -231,8 +245,9 @@ static int on_name_owner_change(sd_bus_message *m, void *userdata, sd_bus_error 
 	return 1;
 }
 
-static void on_child_exit(int signum)
+static int on_child_exit(sd_event_source *s, const struct signalfd_siginfo *si, void *userdata)
 {
+	daemon_state_t *context = userdata;
 	int child_exit_status;
 	int status = 0;
 	char **lines = NULL;
@@ -240,11 +255,9 @@ static void on_child_exit(int signum)
 	sd_bus_message *m = NULL;
 	int r;
 
-	pid_t child_pid = global_state_get_child_pid();
-	assert(child_pid);
-	method_t child_method = global_state_get_child_method();
+	method_t child_method = context->method;
 	assert(child_method);
-	int channel_fd = global_state_get_child_channel_fd();
+	int channel_fd = context->channel_fd;
 	assert(channel_fd >= 0);
 
 	{
@@ -269,25 +282,24 @@ static void on_child_exit(int signum)
 		fclose(stream);
 	}
 
-	pid_t ws = waitpid(child_pid, &child_exit_status, 0);
-	if (ws == -1) {
-		ERR("Failed to wait for child process");
-		assert(0);
-	}
-
-	if (WIFEXITED(child_exit_status)) {
-		status = WEXITSTATUS(child_exit_status);
-		if (status != 0) {
-			DEBUG("Failed to run command");
-		}
+	if (si->ssi_code == CLD_EXITED) {
+		status = si->ssi_status;
 	} else {
 		DEBUG("Child process was killed");
-		status = 130; /* killed by SIGINT */
+		/* si->ssi_status is signal code in this case */
+		status = 128 + si->ssi_status;
 	}
 
-	global_state_set_child_data(0, METHOD_NOTSET, -1);
+	/* Reap the zomby */
+	assert(si->ssi_pid == context->child);
+	pid_t ws = waitpid(si->ssi_pid, &child_exit_status, 0);
+	assert(ws != -1);
 
-	r = sd_bus_message_new_signal(global_state_get_bus(), &m,
+	context->child = 0;
+	context->method = METHOD_NOTSET;
+	context->channel_fd = -1;
+
+	r = sd_bus_message_new_signal(context->bus, &m,
 		                      "/org/O1/swupdd/Client",
 		                      "org.O1.swupdd.Client",
 		                      "requestCompleted");
@@ -305,7 +317,7 @@ static void on_child_exit(int signum)
 		ERR("Can't append output to D-Bus message: %s", strerror(-r));
 		goto finish;
 	}
-	r = sd_bus_send(global_state_get_bus(), m, NULL);
+	r = sd_bus_send(context->bus, m, NULL);
 	if (r < 0) {
 		ERR("Can't send message: %s", strerror(-r));
 		goto finish;
@@ -321,7 +333,7 @@ finish:
 	sd_bus_message_unref(m);
 }
 
-static int run_swupd(method_t method, struct list *args)
+static int run_swupd(method_t method, struct list *args, daemon_state_t *context)
 {
 	pid_t pid;
 	int fds[2];
@@ -350,7 +362,9 @@ static int run_swupd(method_t method, struct list *args)
 	}
 
 	close(fds[1]);
-	global_state_set_child_data(pid, method, fds[0]);
+	context->child = pid;
+	context->method = method;
+	context->channel_fd = fds[0];
 
 	return 0;
 }
@@ -359,10 +373,11 @@ static int method_update(sd_bus_message *m,
 	                 void *userdata,
 	                 sd_bus_error *ret_error)
 {
+	daemon_state_t *context = userdata;
 	int r = 0;
 	struct list *args = NULL;
 
-	if (global_state_get_child_pid()) {
+	if (context->child) {
 		r = -EAGAIN;
 		ERR("Busy with ongoing request to swupd");
 		goto finish;
@@ -378,7 +393,7 @@ static int method_update(sd_bus_message *m,
 		goto finish;
 	}
 
-	r  = run_swupd(METHOD_UPDATE, args);
+	r  = run_swupd(METHOD_UPDATE, args, context);
 	if (r < 0) {
 		ERR("Got error when running swupd command: %s", strerror(-r));
 	}
@@ -392,10 +407,11 @@ static int method_verify(sd_bus_message *m,
 	                 void *userdata,
 	                 sd_bus_error *ret_error)
 {
+	daemon_state_t *context = userdata;
 	int r = 0;
 	struct list *args = NULL;
 
-	if (global_state_get_child_pid()) {
+	if (context->child) {
 		r = -EAGAIN;
 		ERR("Busy with ongoing request to swupd");
 		goto finish;
@@ -412,7 +428,7 @@ static int method_verify(sd_bus_message *m,
 		goto finish;
 	}
 
-	r  = run_swupd(METHOD_VERIFY, args);
+	r  = run_swupd(METHOD_VERIFY, args, context);
 	if (r < 0) {
 		ERR("Got error when running swupd command: %s", strerror(-r));
 	}
@@ -426,10 +442,11 @@ static int method_check_update(sd_bus_message *m,
 			       void *userdata,
 			       sd_bus_error *ret_error)
 {
+	daemon_state_t *context = userdata;
 	int r = 0;
 	struct list *args = NULL;
 
-	if (global_state_get_child_pid()) {
+	if (context->child) {
 		r = -EAGAIN;
 		ERR("Busy with ongoing request to swupd");
 		goto finish;
@@ -453,7 +470,7 @@ static int method_check_update(sd_bus_message *m,
 	}
 	args = list_append_data(args, strdup(bundle));
 
-	r  = run_swupd(METHOD_CHECK_UPDATE, args);
+	r  = run_swupd(METHOD_CHECK_UPDATE, args, context);
 	if (r < 0) {
 		ERR("Got error when running swupd command: %s", strerror(-r));
 	}
@@ -467,11 +484,12 @@ static int method_bundle_add(sd_bus_message *m,
 			     void *userdata,
 			     sd_bus_error *ret_error)
 {
+	daemon_state_t *context = userdata;
 	int r = 0;
 	struct list *args = NULL;
 	const char* bundle = NULL;
 
-	if (global_state_get_child_pid()) {
+	if (context->child) {
 		r = -EAGAIN;
 		ERR("Busy with ongoing request to swupd");
 		goto finish;
@@ -506,7 +524,7 @@ static int method_bundle_add(sd_bus_message *m,
 		goto finish;
 	}
 
-	r  = run_swupd(METHOD_BUNDLE_ADD, args);
+	r  = run_swupd(METHOD_BUNDLE_ADD, args, context);
 	if (r < 0) {
 		ERR("Got error when running swupd command: %s", strerror(-r));
 	}
@@ -520,10 +538,11 @@ static int method_bundle_remove(sd_bus_message *m,
 				void *userdata,
 				sd_bus_error *ret_error)
 {
+	daemon_state_t *context = userdata;
 	int r = 0;
 	struct list *args = NULL;
 
-	if (global_state_get_child_pid()) {
+	if (context->child) {
 		r = -EAGAIN;
 		ERR("Busy with ongoing request to swupd");
 		goto finish;
@@ -547,7 +566,7 @@ static int method_bundle_remove(sd_bus_message *m,
 	}
 	args = list_append_data(args, strdup(bundle));
 
-	r  = run_swupd(METHOD_BUNDLE_REMOVE, args);
+	r  = run_swupd(METHOD_BUNDLE_REMOVE, args, context);
 	if (r < 0) {
 		ERR("Got error when running swupd command: %s", strerror(-r));
 	}
@@ -561,11 +580,12 @@ static int method_cancel(sd_bus_message *m,
 			 void *userdata,
 			 sd_bus_error *ret_error)
 {
+	daemon_state_t *context = userdata;
 	int r = 0;
 	pid_t child;
 	int force;
 
-	child = global_state_get_child_pid();
+	child = context->child;
 	if (!child) {
 		r = -ECHILD;
 		ERR("No child process to cancel");
@@ -605,7 +625,7 @@ static int run_bus_event_loop(sd_event *event,
 			break;
 		}
 
-		r = sd_event_run(event, exiting ? (uint64_t) -1 : (uint64_t) 30 * 1000000);
+		r = sd_event_run(event, exiting ? (uint64_t) -1 : (uint64_t) 130 * 1000000);
 		if (r < 0) {
 			ERR("Failed to run event loop: %s", strerror(-r));
 			return r;
@@ -697,14 +717,14 @@ static const sd_bus_vtable swupdd_vtable[] = {
 };
 
 int main(int argc, char *argv[]) {
-	sd_bus_slot *slot = NULL; /* FIXME: not needed? */
+	daemon_state_t context = {};
+	sd_bus_slot *slot = NULL;
 	sd_event *event = NULL;
-	sd_bus *bus = NULL;
+	sigset_t ss;
 	int r;
 
-	global_state_reset();
-
-	signal(SIGCHLD, on_child_exit);
+	memset(&context, 0x00, sizeof(daemon_state_t));
+	context.channel_fd = -1;
 
         r = sd_event_default(&event);
         if (r < 0) {
@@ -712,16 +732,31 @@ int main(int argc, char *argv[]) {
                 goto finish;
         }
 
+	if (sigemptyset(&ss) < 0 ||
+	    sigaddset(&ss, SIGCHLD) < 0) {
+		r = -errno;
+		goto finish;
+	}
+
+	if (sigprocmask(SIG_BLOCK, &ss, NULL) < 0) {
+		ERR("Failed to set signal proc mask: %s", strerror(errno));
+		goto finish;
+	}
+	r = sd_event_add_signal(event, NULL, SIGCHLD, on_child_exit, &context);
+	if (r < 0) {
+		ERR("Failed to add signal: %s", strerror(-r));
+		goto finish;
+	}
+
         sd_event_set_watchdog(event, true);
 
-	r = sd_bus_open_system(&bus);
+	r = sd_bus_open_system(&context.bus);
 	if (r < 0) {
 		ERR("Failed to connect to system bus: %s", strerror(-r));
 		goto finish;
 	}
-	global_state_set_bus(bus);
 
-	r = sd_bus_add_object_vtable(bus,
+	r = sd_bus_add_object_vtable(context.bus,
 				     &slot,
 				     "/org/O1/swupdd/Client",
 				     "org.O1.swupdd.Client",
@@ -732,13 +767,15 @@ int main(int argc, char *argv[]) {
 		goto finish;
 	}
 
-	r = sd_bus_request_name(bus, "org.O1.swupdd.Client", 0);
+	sd_bus_slot_set_userdata(slot, &context);
+
+	r = sd_bus_request_name(context.bus, "org.O1.swupdd.Client", 0);
 	if (r < 0) {
 		ERR("Failed to acquire service name: %s", strerror(-r));
 		goto finish;
 	}
 
-        r = sd_bus_attach_event(bus, event, 0);
+        r = sd_bus_attach_event(context.bus, event, 0);
         if (r < 0) {
                 ERR("Failed to attach bus to event loop: %s", strerror(-r));
 		goto finish;
@@ -747,11 +784,11 @@ int main(int argc, char *argv[]) {
 	sd_notify(false,
 		  "READY=1\n"
 		  "STATUS=Daemon startup completed, processing events.");
-	r = run_bus_event_loop(event, bus);
+	r = run_bus_event_loop(event, context.bus);
 
 finish:
 	sd_bus_slot_unref(slot);
-	sd_bus_unref(bus);
+	sd_bus_unref(context.bus);
 	sd_event_unref(event);
 
 	return r < 0 ? EXIT_FAILURE : EXIT_SUCCESS;
