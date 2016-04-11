@@ -27,11 +27,13 @@
 #include <stdlib.h>
 #include <unistd.h>
 #include <stdio.h>
+#include <stdbool.h>
 #include <errno.h>
 #include <signal.h>
 #include <assert.h>
 #include <sys/wait.h>
 #include <systemd/sd-bus.h>
+#include <systemd/sd-daemon.h>
 
 #include "log.h"
 #include "list.h"
@@ -215,6 +217,18 @@ static int bus_message_read_options(struct list **strlist,
 	}
 
 	return 0;
+}
+
+static int on_name_owner_change(sd_bus_message *m, void *userdata, sd_bus_error *ret_error) {
+	sd_event *e = userdata;
+
+	assert(m);
+	assert(e);
+
+	sd_bus_close(sd_bus_message_get_bus(m));
+	sd_event_exit(e, 0);
+
+	return 1;
 }
 
 static void on_child_exit(int signum)
@@ -574,6 +588,102 @@ finish:
 	return sd_bus_reply_method_return(m, "b", (r >= 0));
 }
 
+/* Basically this is a copypasta from systemd's internal function bus_event_loop_with_idle() */
+static int run_bus_event_loop(sd_event *event,
+			      sd_bus *bus)
+{
+	bool exiting = false;
+	int r, code;
+
+	for (;;) {
+		r = sd_event_get_state(event);
+		if (r < 0) {
+			ERR("Failed to get event loop's state: %s", strerror(-r));
+			return r;
+		}
+		if (r == SD_EVENT_FINISHED) {
+			break;
+		}
+
+		r = sd_event_run(event, exiting ? (uint64_t) -1 : (uint64_t) 30 * 1000000);
+		if (r < 0) {
+			ERR("Failed to run event loop: %s", strerror(-r));
+			return r;
+		}
+
+		if (r == 0 && !exiting) {
+			r = sd_bus_try_close(bus);
+			if (r == -EBUSY) {
+				continue;
+			}
+                        /* Fallback for dbus1 connections: we
+                         * unregister the name and wait for the
+                         * response to come through for it */
+                        if (r == -EOPNOTSUPP) {
+				sd_notify(false, "STOPPING=1");
+
+				/* We unregister the name here and then wait for the
+				 * NameOwnerChanged signal for this event to arrive before we
+				 * quit. We do this in order to make sure that any queued
+				 * requests are still processed before we really exit. */
+
+				char *match = NULL;
+				const char *unique;
+				r = sd_bus_get_unique_name(bus, &unique);
+				if (r < 0) {
+					ERR("Failed to get unique D-Bus name: %s", strerror(-r));
+					return r;
+				}
+				r = asprintf(&match,
+					     "sender='org.freedesktop.DBus',"
+					     "type='signal',"
+					     "interface='org.freedesktop.DBus',"
+					     "member='NameOwnerChanged',"
+					     "path='/org/freedesktop/DBus',"
+					     "arg0='org.O1.swupdd.Client',"
+					     "arg1='%s',"
+					     "arg2=''", unique);
+				if (r < 0) {
+					ERR("Not enough memory to allocate string");
+					return r;
+				}
+
+				r = sd_bus_add_match(bus, NULL, match, on_name_owner_change, event);
+				if (r < 0) {
+					ERR("Failed to add signal listener: %s", strerror(-r));
+					free(match);
+					return r;
+				}
+
+				r = sd_bus_release_name(bus, "org.O1.swupdd.Client");
+				if (r < 0) {
+					ERR("Failed to release service name: %s", strerror(-r));
+					free(match);
+					return r;
+				}
+
+				exiting = true;
+				free(match);
+				continue;
+			}
+
+			if (r < 0) {
+				ERR("Failed to close bus: %s", strerror(-r));
+				return r;
+			}
+			sd_event_exit(event, 0);
+			break;
+		}
+	}
+
+        r = sd_event_get_exit_code(event, &code);
+        if (r < 0) {
+                return r;
+	}
+
+        return code;
+}
+
 static const sd_bus_vtable swupdd_vtable[] = {
 	SD_BUS_VTABLE_START(0),
 	SD_BUS_METHOD("checkUpdate", "a{sv}s", "b", method_check_update, 0),
@@ -602,7 +712,7 @@ int main(int argc, char *argv[]) {
                 goto finish;
         }
 
-        sd_event_set_watchdog(event, 1);
+        sd_event_set_watchdog(event, true);
 
 	r = sd_bus_open_system(&bus);
 	if (r < 0) {
@@ -634,35 +744,10 @@ int main(int argc, char *argv[]) {
 		goto finish;
 	}
 
-	for (;;) {
-		r = sd_event_get_state(event);
-		if (r < 0) {
-			ERR("Failed to get event loop's state: %s", strerror(-r));
-			goto finish;
-		}
-		if (r == SD_EVENT_FINISHED) {
-			break;
-		}
-
-		r = sd_event_run(event, (uint64_t) -1 /*timeout*/);
-		if (r < 0) {
-			ERR("Failed to run event loop: %s", strerror(-r));
-			goto finish;
-		}
-
-		if (r == 0) {
-			r = sd_bus_try_close(bus);
-			if (r == -EBUSY) {
-				continue;
-			}
-			if (r < 0) {
-				ERR("Failed to close bus: %s", strerror(-r));
-				goto finish;
-			}
-			sd_event_exit(event, 0);
-			break;
-		}
-	}
+	sd_notify(false,
+		  "READY=1\n"
+		  "STATUS=Daemon startup completed, processing events.");
+	r = run_bus_event_loop(event, bus);
 
 finish:
 	sd_bus_slot_unref(slot);
