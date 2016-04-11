@@ -587,13 +587,22 @@ static const sd_bus_vtable swupdd_vtable[] = {
 };
 
 int main(int argc, char *argv[]) {
-	sd_bus_slot *slot = NULL;
+	sd_bus_slot *slot = NULL; /* FIXME: not needed? */
+	sd_event *event = NULL;
 	sd_bus *bus = NULL;
 	int r;
 
 	global_state_reset();
 
 	signal(SIGCHLD, on_child_exit);
+
+        r = sd_event_default(&event);
+        if (r < 0) {
+                ERR("Failed to allocate event loop: %s", strerror(-r));
+                goto finish;
+        }
+
+        sd_event_set_watchdog(event, 1);
 
 	r = sd_bus_open_system(&bus);
 	if (r < 0) {
@@ -619,26 +628,46 @@ int main(int argc, char *argv[]) {
 		goto finish;
 	}
 
+        r = sd_bus_attach_event(bus, event, 0);
+        if (r < 0) {
+                ERR("Failed to attach bus to event loop: %s", strerror(-r));
+		goto finish;
+	}
+
 	for (;;) {
-		r = sd_bus_process(bus, NULL);
+		r = sd_event_get_state(event);
 		if (r < 0) {
-			ERR("Failed to process: %s", strerror(-r));
+			ERR("Failed to get event loop's state: %s", strerror(-r));
 			goto finish;
 		}
-		if (r > 0) {
-			continue;
+		if (r == SD_EVENT_FINISHED) {
+			break;
 		}
 
-		r = sd_bus_wait(bus, (uint64_t) -1);
-		if (r < 0 && r != -EINTR) {
-			ERR("Failed to wait on bus: %s", strerror(-r));
+		r = sd_event_run(event, (uint64_t) -1 /*timeout*/);
+		if (r < 0) {
+			ERR("Failed to run event loop: %s", strerror(-r));
 			goto finish;
+		}
+
+		if (r == 0) {
+			r = sd_bus_try_close(bus);
+			if (r == -EBUSY) {
+				continue;
+			}
+			if (r < 0) {
+				ERR("Failed to close bus: %s", strerror(-r));
+				goto finish;
+			}
+			sd_event_exit(event, 0);
+			break;
 		}
 	}
 
 finish:
 	sd_bus_slot_unref(slot);
 	sd_bus_unref(bus);
+	sd_event_unref(event);
 
 	return r < 0 ? EXIT_FAILURE : EXIT_SUCCESS;
 }
