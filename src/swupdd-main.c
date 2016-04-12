@@ -40,6 +40,7 @@
 #include "list.h"
 
 #define SWUPD_CLIENT    "swupd"
+#define TIMEOUT_EXIT_SEC 30
 
 typedef enum {
 	METHOD_NOTSET = 0,
@@ -595,8 +596,9 @@ finish:
 
 /* Basically this is a copypasta from systemd's internal function bus_event_loop_with_idle() */
 static int run_bus_event_loop(sd_event *event,
-			      sd_bus *bus)
+			      daemon_state_t *context)
 {
+	sd_bus *bus = context->bus;
 	bool exiting = false;
 	int r, code;
 
@@ -610,13 +612,13 @@ static int run_bus_event_loop(sd_event *event,
 			break;
 		}
 
-		r = sd_event_run(event, exiting ? (uint64_t) -1 : (uint64_t) 130 * 1000000);
+		r = sd_event_run(event, exiting ? (uint64_t) -1 : (uint64_t) TIMEOUT_EXIT_SEC * 1000000);
 		if (r < 0) {
 			ERR("Failed to run event loop: %s", strerror(-r));
 			return r;
 		}
 
-		if (r == 0 && !exiting) {
+		if (!context->method && r == 0 && !exiting) {
 			r = sd_bus_try_close(bus);
 			if (r == -EBUSY) {
 				continue;
@@ -769,7 +771,7 @@ int main(int argc, char *argv[]) {
 	sd_notify(false,
 		  "READY=1\n"
 		  "STATUS=Daemon startup completed, processing events.");
-	r = run_bus_event_loop(event, context.bus);
+	r = run_bus_event_loop(event, &context);
 
 finish:
 	sd_bus_slot_unref(slot);
