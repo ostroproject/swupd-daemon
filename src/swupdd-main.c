@@ -29,7 +29,9 @@
 #include <stdio.h>
 #include <stdbool.h>
 #include <errno.h>
+#include <limits.h>
 #include <assert.h>
+#include <fcntl.h>
 #include <sys/wait.h>
 #include <systemd/sd-bus.h>
 #include <systemd/sd-daemon.h>
@@ -52,7 +54,6 @@ typedef struct _daemon_state {
 	sd_bus *bus;
 	pid_t child;
 	method_t method;
-	int channel_fd;
 } daemon_state_t;
 
 static const char * const _method_str_map[] = {
@@ -245,42 +246,44 @@ static int on_name_owner_change(sd_bus_message *m, void *userdata, sd_bus_error 
 	return 1;
 }
 
+static int on_childs_output(sd_event_source *s, int fd, uint32_t revents, void *userdata)
+{
+	daemon_state_t *context = userdata;
+	int r = 0;
+	char buffer[PIPE_BUF + 1];
+	ssize_t count;
+	count = read(fd, buffer, PIPE_BUF);
+	if (count > 0) {
+		fwrite(buffer, 1, count, stdout);
+		fflush(stdout);
+		buffer[count] = '\0';
+		r = sd_bus_emit_signal(context->bus,
+				       "/org/O1/swupdd/Client",
+				       "org.O1.swupdd.Client",
+				       "childOutputReceived", "s", buffer);
+		if (r < 0) {
+			ERR("Failed to emit signal: %s", strerror(-r));
+		}
+	} else if (count < 0) {
+		r = -errno;
+		ERR("Failed to read pipe: %s", strerror(errno));
+	} else {
+		close(fd);
+		sd_event_source_unref(s);
+	}
+
+	return r < 0 ? EXIT_FAILURE : EXIT_SUCCESS;
+}
+
 static int on_child_exit(sd_event_source *s, const struct signalfd_siginfo *si, void *userdata)
 {
 	daemon_state_t *context = userdata;
 	int child_exit_status;
 	int status = 0;
-	char **lines = NULL;
-	char **temp = NULL;
-	sd_bus_message *m = NULL;
 	int r;
 
 	method_t child_method = context->method;
 	assert(child_method);
-	int channel_fd = context->channel_fd;
-	assert(channel_fd >= 0);
-
-	{
-		FILE *stream = fdopen(channel_fd, "r");
-		char *line = NULL;
-		ssize_t count;
-		size_t len = 0;
-		size_t line_count = 0;
-
-		while ((count = getline(&line, &len, stream)) != -1) {
-			printf(line); /* echo child's output */
-			line[strcspn(line, "\n")] = 0; /* trim newline */
-			line_count++;
-			lines = realloc(lines, sizeof(char*) * line_count);
-			lines[line_count-1] = strdup(line);
-		}
-		free(line);
-		/* realloc one extra element for the last NULL */
-		lines = realloc(lines, sizeof(char*) * (line_count + 1));
-		lines[line_count] = NULL;
-
-		fclose(stream);
-	}
 
 	if (si->ssi_code == CLD_EXITED) {
 		status = si->ssi_status;
@@ -297,40 +300,18 @@ static int on_child_exit(sd_event_source *s, const struct signalfd_siginfo *si, 
 
 	context->child = 0;
 	context->method = METHOD_NOTSET;
-	context->channel_fd = -1;
 
-	r = sd_bus_message_new_signal(context->bus, &m,
-		                      "/org/O1/swupdd/Client",
-		                      "org.O1.swupdd.Client",
-		                      "requestCompleted");
+	r = sd_bus_emit_signal(context->bus,
+			       "/org/O1/swupdd/Client",
+			       "org.O1.swupdd.Client",
+			       "requestCompleted", "si", _method_str_map[child_method], status);
 	if (r < 0) {
-		ERR("Can't create D-Bus signal: %s", strerror(-r));
-		goto finish;
-	}
-	r = sd_bus_message_append(m, "si", _method_str_map[child_method], status);
-	if (r < 0) {
-		ERR("Can't append method and status to D-Bus message: %s", strerror(-r));
-		goto finish;
-	}
-	r = sd_bus_message_append_strv(m, lines);
-	if (r < 0) {
-		ERR("Can't append output to D-Bus message: %s", strerror(-r));
-		goto finish;
-	}
-	r = sd_bus_send(context->bus, m, NULL);
-	if (r < 0) {
-		ERR("Can't send message: %s", strerror(-r));
+		ERR("Can't emit D-Bus signal: %s", strerror(-r));
 		goto finish;
 	}
 
 finish:
-	temp = lines;
-	while (*temp) {
-		free(*temp);
-		temp++;
-	}
-	free(lines);
-	sd_bus_message_unref(m);
+	return r < 0 ? EXIT_FAILURE : EXIT_SUCCESS;
 }
 
 static int run_swupd(method_t method, struct list *args, daemon_state_t *context)
@@ -339,7 +320,7 @@ static int run_swupd(method_t method, struct list *args, daemon_state_t *context
 	int fds[2];
 	int r;
 
-	r = pipe(fds);
+	r = pipe2(fds, O_DIRECT);
 	if (r < 0) {
 		ERR("Can't create pipe: %s", strerror(errno));
 		return -errno;
@@ -364,7 +345,11 @@ static int run_swupd(method_t method, struct list *args, daemon_state_t *context
 	close(fds[1]);
 	context->child = pid;
 	context->method = method;
-	context->channel_fd = fds[0];
+	sd_event *event = NULL;
+	r = sd_event_default(&event);
+	r = sd_event_add_io(event, NULL, fds[0], EPOLLIN, on_childs_output, context);
+	assert(r >= 0);
+	sd_event_unref(event);
 
 	return 0;
 }
@@ -712,7 +697,8 @@ static const sd_bus_vtable swupdd_vtable[] = {
 	SD_BUS_METHOD("bundleAdd", "a{sv}as", "b", method_bundle_add, 0),
 	SD_BUS_METHOD("bundleRemove", "a{sv}s", "b", method_bundle_remove, 0),
 	SD_BUS_METHOD("cancel", "b", "b", method_cancel, 0),
-	SD_BUS_SIGNAL("requestCompleted", "sias", 0),
+	SD_BUS_SIGNAL("requestCompleted", "si", 0),
+	SD_BUS_SIGNAL("childOutputReceived", "s", 0),
 	SD_BUS_VTABLE_END
 };
 
@@ -724,7 +710,6 @@ int main(int argc, char *argv[]) {
 	int r;
 
 	memset(&context, 0x00, sizeof(daemon_state_t));
-	context.channel_fd = -1;
 
         r = sd_event_default(&event);
         if (r < 0) {
