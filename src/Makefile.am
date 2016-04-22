@@ -6,6 +6,7 @@ swupdd_SOURCES = \
 	$(NULL)
 
 swupdd_CFLAGS = \
+	-Wall \
 	$(SWUPDD_CFLAGS) \
 	$(NULL)
 

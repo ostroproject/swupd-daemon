@@ -872,7 +872,7 @@ static const sd_bus_vtable swupdd_vtable[] = {
 };
 
 int main(int argc, char *argv[]) {
-	daemon_state_t context = {};
+	daemon_state_t context;
 	sd_bus_slot *slot = NULL;
 	sd_event *event = NULL;
 	sigset_t ss;
