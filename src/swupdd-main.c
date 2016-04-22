@@ -572,15 +572,14 @@ static int method_cancel(sd_bus_message *m,
 
 	child = context->child;
 	if (!child) {
-		r = -ECHILD;
-		ERR("No child process to cancel");
-		goto finish;
+		sd_bus_error_set_errnof(ret_error, ECHILD, "No child process to cancel");
+		return -ECHILD;
 	}
 
 	r = sd_bus_message_read(m, "b", &force);
 	if (r < 0) {
-		ERR("Can't read 'force' option: %s", strerror(-r));
-		goto finish;
+		sd_bus_error_set_errnof(ret_error, -r, "Can't read 'force' option");
+		return r;
 	}
 
 	if (force) {
@@ -589,7 +588,6 @@ static int method_cancel(sd_bus_message *m,
 		kill(child, SIGTERM);
 	}
 
-finish:
 	return sd_bus_reply_method_return(m, "b", (r >= 0));
 }
 
