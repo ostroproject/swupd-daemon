@@ -397,6 +397,16 @@ static int run_swupd(method_t method, struct list *args, daemon_state_t *context
 	return 0;
 }
 
+static int check_prerequisites(daemon_state_t *context, sd_bus_error *error)
+{
+	if (context->child) {
+		sd_bus_error_set_errnof(error, EAGAIN, "Busy with ongoing request to swupd");
+		return -EAGAIN;
+	}
+
+	return 0;
+}
+
 static int method_update(sd_bus_message *m,
 	                 void *userdata,
 	                 sd_bus_error *ret_error)
@@ -405,10 +415,9 @@ static int method_update(sd_bus_message *m,
 	int r = 0;
 	struct list *args = NULL;
 
-	if (context->child) {
-		r = -EAGAIN;
-		ERR("Busy with ongoing request to swupd");
-		goto finish;
+	r = check_prerequisites(context, ret_error);
+	if (r < 0) {
+		return r;
 	}
 
 	args = list_append_data(args, strdup(SWUPD_CLIENT));
@@ -420,18 +429,20 @@ static int method_update(sd_bus_message *m,
 	char const * const int_opts[] = {"port", NULL};
 	r = bus_message_read_options(m, str_opts, bool_opts, int_opts, &args, ret_error);
 	if (r < 0) {
-		ERR("Can't read options: %s", strerror(-r));
 		goto finish;
 	}
 
 	r  = run_swupd(METHOD_UPDATE, args, context);
 	if (r < 0) {
-		ERR("Got error when running swupd command: %s", strerror(-r));
+		sd_bus_error_set_errnof(ret_error, -r, "Failed to run swupd command");
+		goto finish;
 	}
+
+	r = sd_bus_reply_method_return(m, "b", (r >= 0));
 
 finish:
 	list_free_list_and_data(args, free);
-	return sd_bus_reply_method_return(m, "b", (r >= 0));
+	return r;
 }
 
 static int method_verify(sd_bus_message *m,
@@ -442,10 +453,9 @@ static int method_verify(sd_bus_message *m,
 	int r = 0;
 	struct list *args = NULL;
 
-	if (context->child) {
-		r = -EAGAIN;
-		ERR("Busy with ongoing request to swupd");
-		goto finish;
+	r = check_prerequisites(context, ret_error);
+	if (r < 0) {
+		return r;
 	}
 
 	args = list_append_data(args, strdup(SWUPD_CLIENT));
@@ -457,18 +467,19 @@ static int method_verify(sd_bus_message *m,
 	char const * const int_opts[] = {"manifest", "port", NULL};
 	r = bus_message_read_options(m, str_opts, bool_opts, int_opts, &args, ret_error);
 	if (r < 0) {
-		ERR("Can't read options: %s", strerror(-r));
 		goto finish;
 	}
 
 	r  = run_swupd(METHOD_VERIFY, args, context);
 	if (r < 0) {
-		ERR("Got error when running swupd command: %s", strerror(-r));
+		sd_bus_error_set_errnof(ret_error, -r, "Failed to run swupd command");
 	}
+
+	r = sd_bus_reply_method_return(m, "b", (r >= 0));
 
 finish:
 	list_free_list_and_data(args, free);
-	return sd_bus_reply_method_return(m, "b", (r >= 0));
+	return r;
 }
 
 static int method_check_update(sd_bus_message *m,
@@ -479,10 +490,9 @@ static int method_check_update(sd_bus_message *m,
 	int r = 0;
 	struct list *args = NULL;
 
-	if (context->child) {
-		r = -EAGAIN;
-		ERR("Busy with ongoing request to swupd");
-		goto finish;
+	r = check_prerequisites(context, ret_error);
+	if (r < 0) {
+		return r;
 	}
 
 	args = list_append_data(args, strdup(SWUPD_CLIENT));
@@ -493,26 +503,28 @@ static int method_check_update(sd_bus_message *m,
 	char const * const int_opts[] = {"port", NULL};
 	r = bus_message_read_options(m, str_opts, bool_opts, int_opts, &args, ret_error);
 	if (r < 0) {
-		ERR("Can't read options: %s", strerror(-r));
 		goto finish;
 	}
 
 	const char *bundle;
 	r = sd_bus_message_read(m, "s", &bundle);
 	if (r < 0) {
-		ERR("Can't read bundle: %s", strerror(-r));
+		sd_bus_error_set_errnof(ret_error, -r, "Can't read bundle");
 		goto finish;
 	}
 	args = list_append_data(args, strdup(bundle));
 
 	r  = run_swupd(METHOD_CHECK_UPDATE, args, context);
 	if (r < 0) {
-		ERR("Got error when running swupd command: %s", strerror(-r));
+		sd_bus_error_set_errnof(ret_error, -r, "Failed to run swupd command");
+		goto finish;
 	}
+
+	r = sd_bus_reply_method_return(m, "b", (r >= 0));
 
 finish:
 	list_free_list_and_data(args, free);
-	return sd_bus_reply_method_return(m, "b", (r >= 0));
+	return r;
 }
 
 static int method_bundle_add(sd_bus_message *m,
@@ -524,10 +536,9 @@ static int method_bundle_add(sd_bus_message *m,
 	struct list *args = NULL;
 	const char* bundle = NULL;
 
-	if (context->child) {
-		r = -EAGAIN;
-		ERR("Busy with ongoing request to swupd");
-		goto finish;
+	r = check_prerequisites(context, ret_error);
+	if (r < 0) {
+		return r;
 	}
 
 	args = list_append_data(args, strdup(SWUPD_CLIENT));
@@ -539,36 +550,38 @@ static int method_bundle_add(sd_bus_message *m,
 	char const * const int_opts[] = {"port", NULL};
 	r = bus_message_read_options(m, str_opts, bool_opts, int_opts, &args, ret_error);
 	if (r < 0) {
-		ERR("Can't read options: %s", strerror(-r));
 		goto finish;
 	}
 
 	r = sd_bus_message_enter_container(m, SD_BUS_TYPE_ARRAY, "s");
 	if (r < 0) {
-		ERR("Can't enter container: %s", strerror(-r));
+		sd_bus_error_set_errnof(ret_error, -r, "Can't enter bundles container");
 		goto finish;
 	}
 	while ((r = sd_bus_message_read(m, "s", &bundle)) > 0) {
 		args = list_append_data(args, strdup(bundle));
 	}
 	if (r < 0) {
-		ERR("Can't read bundle name from message: %s", strerror(-r));
+		sd_bus_error_set_errnof(ret_error, -r, "Can't read bundle name");
 		goto finish;
 	}
 	r = sd_bus_message_exit_container(m);
 	if (r < 0) {
-		ERR("Can't exit array container: %s", strerror(-r));
+		sd_bus_error_set_errnof(ret_error, -r, "Can't exit bundles container");
 		goto finish;
 	}
 
 	r  = run_swupd(METHOD_BUNDLE_ADD, args, context);
 	if (r < 0) {
-		ERR("Got error when running swupd command: %s", strerror(-r));
+		sd_bus_error_set_errnof(ret_error, -r, "Failed to run swupd command");
+		goto finish;
 	}
+
+	r = sd_bus_reply_method_return(m, "b", (r >= 0));
 
 finish:
 	list_free_list_and_data(args, free);
-	return sd_bus_reply_method_return(m, "b", (r >= 0));
+	return r;
 }
 
 static int method_bundle_remove(sd_bus_message *m,
@@ -579,10 +592,9 @@ static int method_bundle_remove(sd_bus_message *m,
 	int r = 0;
 	struct list *args = NULL;
 
-	if (context->child) {
-		r = -EAGAIN;
-		ERR("Busy with ongoing request to swupd");
-		goto finish;
+	r = check_prerequisites(context, ret_error);
+	if (r < 0) {
+		return r;
 	}
 
 	args = list_append_data(args, strdup(SWUPD_CLIENT));
@@ -594,26 +606,28 @@ static int method_bundle_remove(sd_bus_message *m,
 	char const * const int_opts[] = {"port", NULL};
 	r = bus_message_read_options(m, str_opts, bool_opts, int_opts, &args, ret_error);
 	if (r < 0) {
-		ERR("Can't read options: %s", strerror(-r));
 		goto finish;
 	}
 
 	const char *bundle;
 	r = sd_bus_message_read(m, "s", &bundle);
 	if (r < 0) {
-		ERR("Can't read bundle: %s", strerror(-r));
+		sd_bus_error_set_errnof(ret_error, -r, "Can't read bundle name");
 		goto finish;
 	}
 	args = list_append_data(args, strdup(bundle));
 
 	r  = run_swupd(METHOD_BUNDLE_REMOVE, args, context);
 	if (r < 0) {
-		ERR("Got error when running swupd command: %s", strerror(-r));
+		sd_bus_error_set_errnof(ret_error, -r, "Failed to run swupd command");
+		goto finish;
 	}
+
+	r = sd_bus_reply_method_return(m, "b", (r >= 0));
 
 finish:
 	list_free_list_and_data(args, free);
-	return sd_bus_reply_method_return(m, "b", (r >= 0));
+	return r;
 }
 
 static int method_cancel(sd_bus_message *m,
