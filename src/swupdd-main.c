@@ -254,8 +254,6 @@ static int on_childs_output(sd_event_source *s, int fd, uint32_t revents, void *
 	ssize_t count;
 	count = read(fd, buffer, PIPE_BUF);
 	if (count > 0) {
-		fwrite(buffer, 1, count, stdout);
-		fflush(stdout);
 		buffer[count] = '\0';
 		r = sd_bus_emit_signal(context->bus,
 				       "/org/O1/swupdd/Client",
@@ -339,6 +337,8 @@ static int run_swupd(method_t method, struct list *args, daemon_state_t *context
 		_exit(1);
 	} else if (pid < 0) {
 		ERR("Failed to fork: %s", strerror(errno));
+		close(fds[1]);
+		close(fds[0]);
 		return -errno;
 	}
 
