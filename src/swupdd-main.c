@@ -132,13 +132,12 @@ static int bus_message_read_option_string(struct list **strlist,
 		return r;
 	}
 
-	r = asprintf(&option, "--%s", optname);
+	r = asprintf(&option, "--%s=\"%s\"", optname, value);
 	if (r < 0) {
 		return -ENOMEM;
 	}
 
 	*strlist = list_append_data(*strlist, option);
-	*strlist = list_append_data(*strlist, strdup(value));
 
 	return 0;
 }
