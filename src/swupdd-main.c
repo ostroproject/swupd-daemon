@@ -301,7 +301,8 @@ static int on_childs_output(sd_event_source *s, int fd, uint32_t revents, void *
 	int r = 0;
 	char buffer[PIPE_BUF + 1];
 	ssize_t count;
-	count = read(fd, buffer, PIPE_BUF);
+
+	while ((count = read(fd, buffer, PIPE_BUF)) < 0 && ((errno == EINTR) || (errno == EAGAIN))) {}
 	if (count > 0) {
 		buffer[count] = '\0';
 		r = sd_bus_emit_signal(context->bus,
@@ -311,15 +312,18 @@ static int on_childs_output(sd_event_source *s, int fd, uint32_t revents, void *
 		if (r < 0) {
 			ERR("Failed to emit signal: %s", strerror(-r));
 		}
+
+		return 0;
 	} else if (count < 0) {
-		r = -errno;
 		ERR("Failed to read pipe: %s", strerror(errno));
-	} else {
-		close(fd);
-		sd_event_source_unref(s);
+		/* Disable the handler since the pipe is broken */
+		r = -1;
 	}
 
-	return r < 0 ? EXIT_FAILURE : EXIT_SUCCESS;
+	/* No more events for this handler are expected */
+	close(fd);
+	sd_event_source_unref(s);
+	return r;
 }
 
 static int on_child_exit(sd_event_source *s, const struct signalfd_siginfo *si, void *userdata)
