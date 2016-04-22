@@ -48,7 +48,9 @@ typedef enum {
 	METHOD_UPDATE,
 	METHOD_VERIFY,
 	METHOD_BUNDLE_ADD,
-	METHOD_BUNDLE_REMOVE
+	METHOD_BUNDLE_REMOVE,
+	METHOD_HASH_DUMP,
+	METHOD_SEARCH
 } method_t;
 
 typedef struct _daemon_state {
@@ -63,7 +65,9 @@ static const char * const _method_str_map[] = {
 	"Update",
 	"Verify",
 	"BundleAdd",
-	"BundleRemove"
+	"BundleRemove",
+	"HashDump",
+	"Search"
 };
 
 static const char * const _method_opt_map[] = {
@@ -72,7 +76,9 @@ static const char * const _method_opt_map[] = {
 	"update",
 	"verify",
 	"bundle-add",
-	"bundle-remove"
+	"bundle-remove",
+	"hashdump",
+	"search"
 };
 
 static char **list_to_strv(struct list *strlist)
@@ -527,6 +533,97 @@ finish:
 	return r;
 }
 
+static int method_hash_dump(sd_bus_message *m,
+			    void *userdata,
+			    sd_bus_error *ret_error)
+{
+	daemon_state_t *context = userdata;
+	int r = 0;
+	struct list *args = NULL;
+
+	r = check_prerequisites(context, ret_error);
+	if (r < 0) {
+		return r;
+	}
+
+	args = list_append_data(args, strdup(SWUPD_CLIENT));
+	args = list_append_data(args, strdup(_method_opt_map[METHOD_HASH_DUMP]));
+
+	char const * const str_opts[] = {"basepath", NULL};
+	char const * const bool_opts[] = {"no-xattrs", NULL};
+	r = bus_message_read_options(m, str_opts, bool_opts, NULL, &args, ret_error);
+	if (r < 0) {
+		goto finish;
+	}
+
+	const char *filename;
+	r = sd_bus_message_read(m, "s", &filename);
+	if (r < 0) {
+		sd_bus_error_set_errnof(ret_error, -r, "Can't read file name");
+		goto finish;
+	}
+	args = list_append_data(args, strdup(filename));
+
+	r  = run_swupd(METHOD_HASH_DUMP, args, context);
+	if (r < 0) {
+		sd_bus_error_set_errnof(ret_error, -r, "Failed to run swupd command");
+		goto finish;
+	}
+
+	r = sd_bus_reply_method_return(m, "b", (r >= 0));
+
+finish:
+	list_free_list_and_data(args, free);
+	return r;
+}
+
+static int method_search(sd_bus_message *m,
+			 void *userdata,
+			 sd_bus_error *ret_error)
+{
+	daemon_state_t *context = userdata;
+	int r = 0;
+	struct list *args = NULL;
+
+	r = check_prerequisites(context, ret_error);
+	if (r < 0) {
+		return r;
+	}
+
+	args = list_append_data(args, strdup(SWUPD_CLIENT));
+	args = list_append_data(args, strdup(_method_opt_map[METHOD_SEARCH]));
+
+	char const * const str_opts[] = {"url", "contenturl", "versionurl",
+					 "path", "scope", "format", "statedir", NULL};
+	char const * const bool_opts[] = {"library", "binary", "init",
+					  "display-files", NULL};
+	char const * const int_opts[] = {"port", NULL};
+	r = bus_message_read_options(m, str_opts, bool_opts, int_opts, &args, ret_error);
+	if (r < 0) {
+		goto finish;
+	}
+
+	const char *filename;
+	r = sd_bus_message_read(m, "s", &filename);
+	if (r < 0) {
+		sd_bus_error_set_errnof(ret_error, -r, "Can't read file name");
+		goto finish;
+	}
+	args = list_append_data(args, strdup(filename));
+
+	r  = run_swupd(METHOD_SEARCH, args, context);
+	if (r < 0) {
+		sd_bus_error_set_errnof(ret_error, -r, "Failed to run swupd command");
+		goto finish;
+	}
+
+	r = sd_bus_reply_method_return(m, "b", (r >= 0));
+
+finish:
+	list_free_list_and_data(args, free);
+	return r;
+}
+
 static int method_bundle_add(sd_bus_message *m,
 			     void *userdata,
 			     sd_bus_error *ret_error)
@@ -760,6 +857,8 @@ static int run_bus_event_loop(sd_event *event,
 static const sd_bus_vtable swupdd_vtable[] = {
 	SD_BUS_VTABLE_START(0),
 	SD_BUS_METHOD("CheckUpdate", "a{sv}s", "b", method_check_update, 0),
+	SD_BUS_METHOD("HashDump", "a{sv}s", "b", method_hash_dump, 0),
+	SD_BUS_METHOD("Search", "a{sv}s", "b", method_search, 0),
 	SD_BUS_METHOD("Update", "a{sv}", "b", method_update, 0),
 	SD_BUS_METHOD("Verify", "a{sv}", "b", method_verify, 0),
 	SD_BUS_METHOD("BundleAdd", "a{sv}as", "b", method_bundle_add, 0),
