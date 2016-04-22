@@ -302,7 +302,7 @@ static int on_childs_output(sd_event_source *s, int fd, uint32_t revents, void *
 	char buffer[PIPE_BUF + 1];
 	ssize_t count;
 
-	while ((count = read(fd, buffer, PIPE_BUF)) < 0 && ((errno == EINTR) || (errno == EAGAIN))) {}
+	while ((count = read(fd, buffer, PIPE_BUF)) < 0 && (errno == EINTR)) {}
 	if (count > 0) {
 		buffer[count] = '\0';
 		r = sd_bus_emit_signal(context->bus,
@@ -358,11 +358,9 @@ static int on_child_exit(sd_event_source *s, const struct signalfd_siginfo *si, 
 			       "RequestCompleted", "si", _method_str_map[child_method], status);
 	if (r < 0) {
 		ERR("Can't emit D-Bus signal: %s", strerror(-r));
-		goto finish;
 	}
 
-finish:
-	return r < 0 ? EXIT_FAILURE : EXIT_SUCCESS;
+	return 0;
 }
 
 static int run_swupd(method_t method, struct list *args, daemon_state_t *context)
