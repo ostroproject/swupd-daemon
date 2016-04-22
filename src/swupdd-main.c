@@ -108,9 +108,10 @@ static int is_in_array(const char *key, char const * const arr[])
 	return 0;
 }
 
-static int bus_message_read_option_string(struct list **strlist,
-					  sd_bus_message *m,
-					  const char *optname)
+static int bus_message_read_option_string(sd_bus_message *m,
+					  const char *optname,
+					  struct list **strlist,
+					  sd_bus_error *error)
 {
 	int r = 0;
 	char *option = NULL;
@@ -118,22 +119,23 @@ static int bus_message_read_option_string(struct list **strlist,
 
 	r = sd_bus_message_enter_container(m, SD_BUS_TYPE_VARIANT, "s");
 	if (r < 0) {
-		ERR("Failed to enter array container: %s", strerror(-r));
+		sd_bus_error_set_errnof(error, -r, "Failed to enter variant container of '%s'", optname);
 		return r;
 	}
 	r = sd_bus_message_read(m, "s", &value);
 	if (r < 0) {
-		ERR("Can't read option value: %s", strerror(-r));
+		sd_bus_error_set_errnof(error, -r, "Can't read value of '%s'", optname);
 		return r;
 	}
 	r = sd_bus_message_exit_container(m);
 	if (r < 0) {
-		ERR("Can't exit variant container: %s", strerror(-r));
+		sd_bus_error_set_errnof(error, -r, "Can't exit variant container of '%s'", optname);
 		return r;
 	}
 
 	r = asprintf(&option, "--%s=\"%s\"", optname, value);
 	if (r < 0) {
+		sd_bus_error_set_errnof(error, ENOMEM, "Can't allocate memory for '%s'", optname);
 		return -ENOMEM;
 	}
 
@@ -142,26 +144,27 @@ static int bus_message_read_option_string(struct list **strlist,
 	return 0;
 }
 
-static int bus_message_read_option_bool(struct list **strlist,
-					  sd_bus_message *m,
-					  const char *optname)
+static int bus_message_read_option_bool(sd_bus_message *m,
+					const char *optname,
+					struct list **strlist,
+					sd_bus_error *error)
 {
 	int value;
 	int r;
 
 	r = sd_bus_message_enter_container(m, SD_BUS_TYPE_VARIANT, "b");
 	if (r < 0) {
-		ERR("Failed to enter array container: %s", strerror(-r));
+		sd_bus_error_set_errnof(error, -r, "Failed to enter variant container of '%s'", optname);
 		return r;
 	}
 	r = sd_bus_message_read(m, "b", &value);
 	if (r < 0) {
-		ERR("Can't read option value: %s", strerror(-r));
+		sd_bus_error_set_errnof(error, -r, "Can't read value of '%s'", optname);
 		return r;
 	}
 	r = sd_bus_message_exit_container(m);
 	if (r < 0) {
-		ERR("Can't exit variant container: %s", strerror(-r));
+		sd_bus_error_set_errnof(error, -r, "Can't exit variant container of '%s'", optname);
 		return r;
 	}
 
@@ -170,6 +173,7 @@ static int bus_message_read_option_bool(struct list **strlist,
 
 		r = asprintf(&option, "--%s", optname);
 		if (r < 0) {
+			sd_bus_error_set_errnof(error, ENOMEM, "Can't allocate memory for '%s'", optname);
 			return -ENOMEM;
 		}
 		*strlist = list_append_data(*strlist, option);
@@ -177,16 +181,53 @@ static int bus_message_read_option_bool(struct list **strlist,
 	return 0;
 }
 
-static int bus_message_read_options(struct list **strlist,
-	                            sd_bus_message *m,
+static int bus_message_read_option_int(sd_bus_message *m,
+				       const char *optname,
+				       struct list **strlist,
+				       sd_bus_error *error)
+{
+	char *option = NULL;
+	int value;
+	int r;
+
+	r = sd_bus_message_enter_container(m, SD_BUS_TYPE_VARIANT, "i");
+	if (r < 0) {
+		sd_bus_error_set_errnof(error, -r, "Failed to enter variant container of '%s'", optname);
+		return r;
+	}
+	r = sd_bus_message_read(m, "i", &value);
+	if (r < 0) {
+		sd_bus_error_set_errnof(error, -r, "Can't read value of '%s'", optname);
+		return r;
+	}
+	r = sd_bus_message_exit_container(m);
+	if (r < 0) {
+		sd_bus_error_set_errnof(error, -r, "Can't exit variant container of '%s'", optname);
+		return r;
+	}
+
+	r = asprintf(&option, "--%s=\"%i\"", optname, value);
+	if (r < 0) {
+		sd_bus_error_set_errnof(error, ENOMEM, "Can't allocate memory for '%s'", optname);
+		return -ENOMEM;
+	}
+	*strlist = list_append_data(*strlist, option);
+
+	return 0;
+}
+
+static int bus_message_read_options(sd_bus_message *m,
 	                            char const * const opts_str[],
-	                            char const * const opts_bool[])
+	                            char const * const opts_bool[],
+				    char const * const opts_int[],
+				    struct list **strlist,
+				    sd_bus_error *error)
 {
 	int r;
 
 	r = sd_bus_message_enter_container(m, SD_BUS_TYPE_ARRAY, "{sv}");
 	if (r < 0) {
-		ERR("Failed to enter array container: %s", strerror(-r));
+		sd_bus_error_set_errnof(error, -r, "Failed to enter options container");
 		return r;
 	}
 
@@ -195,38 +236,41 @@ static int bus_message_read_options(struct list **strlist,
 
                 r = sd_bus_message_read(m, "s", &argname);
                 if (r < 0) {
-			ERR("Can't read argument name: %s", strerror(-r));
+			sd_bus_error_set_errnof(error, -r, "Can't read option name");
                         return r;
 		}
 		if (is_in_array(argname, opts_str)) {
-			r = bus_message_read_option_string(strlist, m, argname);
+			r = bus_message_read_option_string(m, argname, strlist, error);
 			if (r < 0) {
-				ERR("Can't read option '%s': %s", argname, strerror(-r));
 				return r;
 			}
 		} else if (is_in_array(argname, opts_bool)) {
-			r = bus_message_read_option_bool(strlist, m, argname);
+			r = bus_message_read_option_bool(m, argname, strlist, error);
 			if (r < 0) {
-				ERR("Can't read option '%s': %s", argname, strerror(-r));
+				return r;
+			}
+		} else if (is_in_array(argname, opts_int)) {
+			r = bus_message_read_option_int(m, argname, strlist, error);
+			if (r < 0) {
 				return r;
 			}
 		} else {
 			r = sd_bus_message_skip(m, "v");
 			if (r < 0) {
-				ERR("Can't skip unwanted option value: %s", strerror(-r));
+				sd_bus_error_set_errnof(error, -r, "Can't skip unwanted option value");
 				return r;
 			}
 		}
 
                 r = sd_bus_message_exit_container(m);
                 if (r < 0) {
-			ERR("Can't exit dict entry container: %s", strerror(-r));
+			sd_bus_error_set_errnof(error, -r, "Can't exit dict entry container");
                         return r;
 		}
 	}
 	r = sd_bus_message_exit_container(m);
 	if (r < 0) {
-		ERR("Can't exit array container: %s", strerror(-r));
+		sd_bus_error_set_errnof(error, -r, "Can't exit options container");
 		return r;
 	}
 
@@ -370,8 +414,11 @@ static int method_update(sd_bus_message *m,
 	args = list_append_data(args, strdup(SWUPD_CLIENT));
 	args = list_append_data(args, strdup(_method_opt_map[METHOD_UPDATE]));
 
-	char const * const accepted_str_opts[] = {"url", "contenturl", "versionurl", "log", NULL};
-	r = bus_message_read_options(&args, m, accepted_str_opts, NULL);
+	char const * const str_opts[] = {"url", "contenturl", "versionurl",
+					 "format", "statedir", "path", NULL};
+	char const * const bool_opts[] = {"download", "status", "force", NULL};
+	char const * const int_opts[] = {"port", NULL};
+	r = bus_message_read_options(m, str_opts, bool_opts, int_opts, &args, ret_error);
 	if (r < 0) {
 		ERR("Can't read options: %s", strerror(-r));
 		goto finish;
@@ -404,9 +451,11 @@ static int method_verify(sd_bus_message *m,
 	args = list_append_data(args, strdup(SWUPD_CLIENT));
 	args = list_append_data(args, strdup(_method_opt_map[METHOD_VERIFY]));
 
-	char const * const accepted_str_opts[] = {"url", "contenturl", "versionurl", "log", NULL};
-	char const * const accepted_bool_opts[] = {"fix", NULL};
-	r = bus_message_read_options(&args, m, accepted_str_opts, accepted_bool_opts);
+	char const * const str_opts[] = {"path", "url", "contenturl", "versionurl",
+					 "format", "statedir", NULL};
+	char const * const bool_opts[] = {"fix", "install", "quick", "force", NULL};
+	char const * const int_opts[] = {"manifest", "port", NULL};
+	r = bus_message_read_options(m, str_opts, bool_opts, int_opts, &args, ret_error);
 	if (r < 0) {
 		ERR("Can't read options: %s", strerror(-r));
 		goto finish;
@@ -439,8 +488,10 @@ static int method_check_update(sd_bus_message *m,
 	args = list_append_data(args, strdup(SWUPD_CLIENT));
 	args = list_append_data(args, strdup(_method_opt_map[METHOD_CHECK_UPDATE]));
 
-	char const * const accepted_str_opts[] = {"url", NULL};
-	r = bus_message_read_options(&args, m, accepted_str_opts, NULL);
+	char const * const str_opts[] = {"url", "versionurl", "format", "statedir", "path", NULL};
+	char const * const bool_opts[] = {"force", NULL};
+	char const * const int_opts[] = {"port", NULL};
+	r = bus_message_read_options(m, str_opts, bool_opts, int_opts, &args, ret_error);
 	if (r < 0) {
 		ERR("Can't read options: %s", strerror(-r));
 		goto finish;
@@ -482,9 +533,11 @@ static int method_bundle_add(sd_bus_message *m,
 	args = list_append_data(args, strdup(SWUPD_CLIENT));
 	args = list_append_data(args, strdup(_method_opt_map[METHOD_BUNDLE_ADD]));
 
-	char const * const accepted_str_opts[] = {"url", NULL};
-	char const * const accepted_bool_opts[] = {"list", NULL};
-	r = bus_message_read_options(&args, m, accepted_str_opts, accepted_bool_opts);
+	char const * const str_opts[] = {"url", "contenturl", "versionurl",
+					 "path", "format", "statedir", NULL};
+	char const * const bool_opts[] = {"list", "force", NULL};
+	char const * const int_opts[] = {"port", NULL};
+	r = bus_message_read_options(m, str_opts, bool_opts, int_opts, &args, ret_error);
 	if (r < 0) {
 		ERR("Can't read options: %s", strerror(-r));
 		goto finish;
@@ -535,8 +588,11 @@ static int method_bundle_remove(sd_bus_message *m,
 	args = list_append_data(args, strdup(SWUPD_CLIENT));
 	args = list_append_data(args, strdup(_method_opt_map[METHOD_BUNDLE_REMOVE]));
 
-	char const * const accepted_str_opts[] = {"url", NULL};
-	r = bus_message_read_options(&args, m, accepted_str_opts, NULL);
+	char const * const str_opts[] = {"path", "url", "contenturl", "versionurl",
+					 "format", "statedir", NULL};
+	char const * const bool_opts[] = {"force", NULL};
+	char const * const int_opts[] = {"port", NULL};
+	r = bus_message_read_options(m, str_opts, bool_opts, int_opts, &args, ret_error);
 	if (r < 0) {
 		ERR("Can't read options: %s", strerror(-r));
 		goto finish;
