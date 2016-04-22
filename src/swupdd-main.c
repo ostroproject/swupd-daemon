@@ -586,7 +586,7 @@ static int method_cancel(sd_bus_message *m,
 	if (force) {
 		kill(child, SIGKILL);
 	} else {
-		kill(child, SIGINT);
+		kill(child, SIGTERM);
 	}
 
 finish:
