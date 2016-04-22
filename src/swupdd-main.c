@@ -80,8 +80,7 @@ static char **list_to_strv(struct list *strlist)
 	char **strv;
 	char **temp;
 
-	strv = (char **)malloc((list_len(strlist) + 1) * sizeof(char *));
-	memset(strv, 0x00, (list_len(strlist) + 1) * sizeof(char *));
+	strv = (char **)calloc((list_len(strlist) + 1), sizeof(char *));
 
 	temp = strv;
 	while (strlist)
