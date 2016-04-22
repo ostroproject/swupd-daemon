@@ -59,11 +59,11 @@ typedef struct _daemon_state {
 
 static const char * const _method_str_map[] = {
 	NULL,
-	"checkUpdate",
-	"update",
-	"verify",
-	"bundleAdd",
-	"bundleRemove"
+	"CheckUpdate",
+	"Update",
+	"Verify",
+	"BundleAdd",
+	"BundleRemove"
 };
 
 static const char * const _method_opt_map[] = {
@@ -258,7 +258,7 @@ static int on_childs_output(sd_event_source *s, int fd, uint32_t revents, void *
 		r = sd_bus_emit_signal(context->bus,
 				       "/org/O1/swupdd/Client",
 				       "org.O1.swupdd.Client",
-				       "childOutputReceived", "s", buffer);
+				       "ChildOutputReceived", "s", buffer);
 		if (r < 0) {
 			ERR("Failed to emit signal: %s", strerror(-r));
 		}
@@ -302,7 +302,7 @@ static int on_child_exit(sd_event_source *s, const struct signalfd_siginfo *si, 
 	r = sd_bus_emit_signal(context->bus,
 			       "/org/O1/swupdd/Client",
 			       "org.O1.swupdd.Client",
-			       "requestCompleted", "si", _method_str_map[child_method], status);
+			       "RequestCompleted", "si", _method_str_map[child_method], status);
 	if (r < 0) {
 		ERR("Can't emit D-Bus signal: %s", strerror(-r));
 		goto finish;
@@ -690,14 +690,14 @@ static int run_bus_event_loop(sd_event *event,
 
 static const sd_bus_vtable swupdd_vtable[] = {
 	SD_BUS_VTABLE_START(0),
-	SD_BUS_METHOD("checkUpdate", "a{sv}s", "b", method_check_update, 0),
-	SD_BUS_METHOD("update", "a{sv}", "b", method_update, 0),
-	SD_BUS_METHOD("verify", "a{sv}", "b", method_verify, 0),
-	SD_BUS_METHOD("bundleAdd", "a{sv}as", "b", method_bundle_add, 0),
-	SD_BUS_METHOD("bundleRemove", "a{sv}s", "b", method_bundle_remove, 0),
-	SD_BUS_METHOD("cancel", "b", "b", method_cancel, 0),
-	SD_BUS_SIGNAL("requestCompleted", "si", 0),
-	SD_BUS_SIGNAL("childOutputReceived", "s", 0),
+	SD_BUS_METHOD("CheckUpdate", "a{sv}s", "b", method_check_update, 0),
+	SD_BUS_METHOD("Update", "a{sv}", "b", method_update, 0),
+	SD_BUS_METHOD("Verify", "a{sv}", "b", method_verify, 0),
+	SD_BUS_METHOD("BundleAdd", "a{sv}as", "b", method_bundle_add, 0),
+	SD_BUS_METHOD("BundleRemove", "a{sv}s", "b", method_bundle_remove, 0),
+	SD_BUS_METHOD("Cancel", "b", "b", method_cancel, 0),
+	SD_BUS_SIGNAL("RequestCompleted", "si", 0),
+	SD_BUS_SIGNAL("ChildOutputReceived", "s", 0),
 	SD_BUS_VTABLE_END
 };
 
