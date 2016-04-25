@@ -136,13 +136,14 @@ static int bus_message_read_option_string(sd_bus_message *m,
 		return r;
 	}
 
-	r = asprintf(&option, "--%s=\"%s\"", optname, value);
+	r = asprintf(&option, "--%s", optname);
 	if (r < 0) {
 		sd_bus_error_set_errnof(error, ENOMEM, "Can't allocate memory for '%s'", optname);
 		return -ENOMEM;
 	}
 
 	*strlist = list_append_data(*strlist, option);
+	*strlist = list_append_data(*strlist, strdup(value));
 
 	return 0;
 }
@@ -190,6 +191,7 @@ static int bus_message_read_option_int(sd_bus_message *m,
 				       sd_bus_error *error)
 {
 	char *option = NULL;
+	char *value_str = NULL;
 	int value;
 	int r;
 
@@ -209,12 +211,17 @@ static int bus_message_read_option_int(sd_bus_message *m,
 		return r;
 	}
 
-	r = asprintf(&option, "--%s=\"%i\"", optname, value);
-	if (r < 0) {
+	if (asprintf(&option, "--%s", optname) < 0) {
 		sd_bus_error_set_errnof(error, ENOMEM, "Can't allocate memory for '%s'", optname);
 		return -ENOMEM;
 	}
 	*strlist = list_append_data(*strlist, option);
+
+	if (asprintf(&value_str, "%i", value) < 0) {
+		sd_bus_error_set_errnof(error, ENOMEM, "Can't allocate memory for '%i'", value);
+		return -ENOMEM;
+	}
+	*strlist = list_append_data(*strlist, value_str);
 
 	return 0;
 }
