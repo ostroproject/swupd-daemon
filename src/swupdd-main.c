@@ -29,6 +29,7 @@
 #include <limits.h>
 #include <assert.h>
 #include <fcntl.h>
+#include <termios.h>
 #include <sys/wait.h>
 #include <systemd/sd-bus.h>
 #include <systemd/sd-daemon.h>
@@ -306,6 +307,10 @@ static int on_childs_output(sd_event_source *s, int fd, uint32_t revents, void *
 	char buffer[PIPE_BUF + 1];
 	ssize_t count;
 
+	if ((revents & EPOLLHUP) == EPOLLHUP) {
+		goto finish;
+	}
+
 	while ((count = read(fd, buffer, PIPE_BUF)) < 0 && (errno == EINTR)) {}
 	if (count > 0) {
 		buffer[count] = '\0';
@@ -324,6 +329,7 @@ static int on_childs_output(sd_event_source *s, int fd, uint32_t revents, void *
 		r = -1;
 	}
 
+finish:
 	/* No more events for this handler are expected */
 	close(fd);
 	sd_event_source_unref(s);
@@ -370,39 +376,65 @@ static int on_child_exit(sd_event_source *s, const struct signalfd_siginfo *si, 
 static int run_swupd(method_t method, struct list *args, daemon_state_t *context)
 {
 	pid_t pid;
-	int fds[2];
+	int fdm, fds;
 	int r;
 
-	r = pipe2(fds, O_DIRECT);
-	if (r < 0) {
-		ERR("Can't create pipe: %s", strerror(errno));
+	fdm = posix_openpt(O_RDONLY|O_NOCTTY);
+	if (fdm < 0) {
+		ERR("Can't open pseudo terminal: %s", strerror(errno));
+		return -errno;
+	}
+	r = grantpt(fdm);
+	if (r != 0) {
+		ERR("Can't grant pseudo terminal: %s", strerror(errno));
+		return -errno;
+	}
+	r = unlockpt(fdm);
+	if (r != 0) {
+		ERR("Can't unlock pseudo terminal: %s", strerror(errno));
+		return -errno;
+	}
+
+	fds = open(ptsname(fdm), O_WRONLY);
+	if (fds < 0) {
+		ERR("Can't open slave pseudo terminal: %s", strerror(errno));
 		return -errno;
 	}
 
 	pid = fork();
 
 	if (pid == 0) { /* child */
-		dup2(STDOUT_FILENO, STDERR_FILENO);
-		while ((dup2(fds[1], STDOUT_FILENO) == -1) && (errno == EINTR)) {}
-		close(fds[1]);
-		close(fds[0]);
+		struct termios old_term_settings;
+		struct termios new_term_settings;
+		r = tcgetattr(fds, &old_term_settings);
+		if (r < 0) {
+			ERR("Can't get slave term settings: %s", strerror(errno));
+			_exit(1);
+		}
+		new_term_settings = old_term_settings;
+		cfmakeraw(&new_term_settings);
+		tcsetattr(fds, TCSANOW, &new_term_settings);
+		while ((dup2(fds, STDOUT_FILENO) == -1) && (errno == EINTR)) {}
+		while ((dup2(fds, STDERR_FILENO) == -1) && (errno == EINTR)) {}
+		close(fds);
+		close(fdm);
 		char **argv = list_to_strv(list_head(args));
 		execvp(*argv, argv);
 		ERR("This line must not be reached");
 		_exit(1);
 	} else if (pid < 0) {
 		ERR("Failed to fork: %s", strerror(errno));
-		close(fds[1]);
-		close(fds[0]);
+		close(fds);
+		close(fdm);
 		return -errno;
 	}
 
-	close(fds[1]);
+	close(fds);
 	context->child = pid;
 	context->method = method;
 	sd_event *event = NULL;
 	r = sd_event_default(&event);
-	r = sd_event_add_io(event, NULL, fds[0], EPOLLIN, on_childs_output, context);
+	r = sd_event_add_io(event, NULL, fdm, EPOLLIN, on_childs_output, context);
 	assert(r >= 0);
 	sd_event_unref(event);
 
